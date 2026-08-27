@@ -8,7 +8,9 @@ trap 'rm -rf -- "$test_dir"' EXIT
 
 package_dir="$test_dir/packages"
 install_root="$test_dir/root"
-mkdir -p -- "$package_dir" "$install_root"
+admin_dir="$install_root/var/lib/dpkg"
+mkdir -p -- "$package_dir" "$admin_dir" "$install_root/var/log"
+touch "$admin_dir/status"
 
 "$repo_dir/scripts/build-deb.sh" "$package_dir"
 package=$(find "$package_dir" -maxdepth 1 -name 'atvv-bridge_*.deb' -print -quit)
@@ -33,10 +35,9 @@ printf 'keep_wav = true\n' >"$user_config"
 
 payload_files=$(dpkg-deb --fsys-tarfile "$package" | tar -tf -)
 ! grep -Ev '^\./($|usr(/|$))' <<<"$payload_files"
-dpkg-deb --extract "$package" "$install_root"
+fakeroot dpkg --root="$install_root" --admindir="$admin_dir" --log=/dev/null \
+    --force-bad-path --unpack "$package"
 test ! -e "$install_root/etc/systemd/user/default.target.wants/atvv-bridge.service"
-test -f "$user_state/retained.wav"
-test -f "$user_config"
 
 unit="$install_root/usr/lib/systemd/user/atvv-bridge.service"
 grep -Fxq 'ExecStart=/usr/bin/atvv-bridge' "$unit"
@@ -46,3 +47,10 @@ sed "s|^ExecStart=/usr/bin/atvv-bridge$|ExecStart=$install_root/usr/bin/atvv-bri
     "$unit" >"$test_dir/atvv-bridge.service"
 systemd-analyze verify --user --generators=no --man=no \
     "$test_dir/atvv-bridge.service"
+
+fakeroot dpkg --root="$install_root" --admindir="$admin_dir" --log=/dev/null \
+    --force-bad-path --remove atvv-bridge
+test -f "$user_state/retained.wav"
+test -f "$user_config"
+test ! -e "$install_root/usr/bin/atvv-bridge"
+test ! -e "$unit"

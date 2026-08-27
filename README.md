@@ -16,8 +16,8 @@ installation and configuration are specific to the user's desktop.
 
 ## Build the Debian package
 
-On a Debian system, install Rust 1.85 or newer plus `dpkg-dev`, `jq`, and
-`systemd`, then run:
+On a Debian system, install Rust 1.85 or newer plus `dpkg-dev`, `fakeroot`,
+`jq`, and `systemd`, then run:
 
 ```sh
 tests/debian-package.sh

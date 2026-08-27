@@ -15,7 +15,7 @@ jobs:
       - name: Install Debian packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes dpkg-dev jq systemd
+          sudo apt-get install --yes dpkg-dev fakeroot jq systemd
       - name: Install Rust 1.85
         run: rustup toolchain install 1.85.0 --profile minimal --component rustfmt
       - name: Check formatting
