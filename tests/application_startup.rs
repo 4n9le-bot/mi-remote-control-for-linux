@@ -343,7 +343,7 @@ fn completed_capture_is_transcribed_committed_and_deleted() {
             Ok(CommandOutput {
                 status: 0,
                 stdout: format!(
-                    "Loading audio file: capture.wav\nProcessing 240 samples (0.02s)...\n\n  {transcript}\t\n"
+                    "Loading audio file: capture.wav\nAudio format: 16000 Hz, 1 channel(s), Int\nProcessing 240 samples (0.02s)...\n\n  {transcript}\t\n"
                 )
                 .into_bytes(),
                 stderr: Vec::new(),
@@ -536,7 +536,7 @@ No speech detected, skipping transcription.\n";
 
 #[test]
 fn empty_transcript_after_voxtype_wrapper_output_is_a_successful_no_op() {
-    let stdout = "Loading audio file: capture.wav\nProcessing 240 samples (0.02s)...\n\n\n";
+    let stdout = "Loading audio file: capture.wav\nAudio format: 16000 Hz, 1 channel(s), Int\nProcessing 240 samples (0.02s)...\n\n\n";
     let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
     boundaries.process_results = VecDeque::from([successful_process(stdout)]);
 
@@ -567,6 +567,18 @@ fn unwrapped_paragraphs_preserve_all_internal_transcript_content() {
         ["--text", transcript],
         "internal paragraph separators are transcript content"
     );
+}
+
+#[test]
+fn transcript_that_starts_like_one_wrapper_line_is_not_rewritten() {
+    let transcript = "Loading audio file: notes\n\nsecond paragraph";
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.process_results =
+        VecDeque::from([successful_process(transcript), successful_process("")]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(boundaries.commands[1].args, ["--text", transcript]);
 }
 
 #[test]

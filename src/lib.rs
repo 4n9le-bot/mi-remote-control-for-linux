@@ -1110,11 +1110,19 @@ fn voxtype_transcript(stdout: &str) -> Option<&str> {
     if output.is_empty() || output.lines().last() == Some(NO_SPEECH) {
         return None;
     }
-    if stdout.trim_start().starts_with("Loading audio file:")
-        && let Some((_, transcript)) = stdout.split_once("\n\n")
-    {
-        let transcript = transcript.trim();
-        return (!transcript.is_empty()).then_some(transcript);
+    if let Some((wrapper, transcript)) = stdout.split_once("\n\n") {
+        let mut wrapper_lines = wrapper.trim_start().lines();
+        let is_voxtype_wrapper = wrapper_lines
+            .next()
+            .is_some_and(|line| line.starts_with("Loading audio file:"))
+            && wrapper_lines
+                .next()
+                .is_some_and(|line| line.starts_with("Audio format:"))
+            && wrapper_lines.any(|line| line.starts_with("Processing "));
+        if is_voxtype_wrapper {
+            let transcript = transcript.trim();
+            return (!transcript.is_empty()).then_some(transcript);
+        }
     }
     Some(output)
 }
