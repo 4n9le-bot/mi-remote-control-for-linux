@@ -180,6 +180,26 @@ fn monitor_waits_without_failing_and_attaches_when_a_remote_appears() {
 }
 
 #[test]
+fn monitor_forwards_shutdown_while_waiting_for_a_remote() {
+    let mut gatt = ControlledGatt {
+        snapshots: VecDeque::from([BluezSnapshot::default(), BluezSnapshot::default()]),
+        changes: VecDeque::from([AtvvChange::Stopped]),
+        capabilities: Vec::new(),
+        operations: Vec::new(),
+    };
+    let mut monitor = AttachmentMonitor::default();
+
+    assert_eq!(
+        next_event(&mut monitor, &mut gatt).unwrap(),
+        AtvvEvent::WaitingForRemote
+    );
+    assert_eq!(
+        next_event(&mut monitor, &mut gatt).unwrap(),
+        AtvvEvent::Stopped
+    );
+}
+
+#[test]
 fn monitor_does_not_report_ready_when_capability_negotiation_fails() {
     let mut gatt = ControlledGatt {
         snapshots: VecDeque::from([ready_snapshot()]),
@@ -214,6 +234,45 @@ fn rebuilt_gatt_endpoints_force_resubscription_and_renegotiation() {
     let mut gatt = ControlledGatt {
         snapshots: VecDeque::from([first, rebuilt.clone(), rebuilt]),
         changes: VecDeque::new(),
+        capabilities: vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78, 0x00, 0x00],
+        operations: Vec::new(),
+    };
+    let mut monitor = AttachmentMonitor::default();
+
+    assert!(matches!(
+        next_event(&mut monitor, &mut gatt),
+        Ok(AtvvEvent::RemoteReady { .. })
+    ));
+    assert_eq!(
+        next_event(&mut monitor, &mut gatt).unwrap(),
+        AtvvEvent::WaitingForRemote
+    );
+    assert!(matches!(
+        next_event(&mut monitor, &mut gatt),
+        Ok(AtvvEvent::RemoteReady { .. })
+    ));
+    assert_eq!(
+        gatt.operations
+            .iter()
+            .filter(|operation| matches!(operation, GattOperation::GetCapabilities { .. }))
+            .count(),
+        2
+    );
+    assert!(gatt.operations.contains(&GattOperation::Subscribe(
+        "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0010/char0014".into()
+    )));
+}
+
+#[test]
+fn removed_gatt_objects_return_to_waiting_before_reattachment() {
+    let first = ready_snapshot();
+    let mut rebuilt = ready_snapshot();
+    for characteristic in &mut rebuilt.characteristics {
+        characteristic.path = characteristic.path.replace("char000", "char001");
+    }
+    let mut gatt = ControlledGatt {
+        snapshots: VecDeque::from([first.clone(), first, BluezSnapshot::default(), rebuilt]),
+        changes: VecDeque::from([AtvvChange::TopologyChanged]),
         capabilities: vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78, 0x00, 0x00],
         operations: Vec::new(),
     };

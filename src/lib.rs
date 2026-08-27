@@ -159,6 +159,7 @@ pub enum AtvvChange {
     ConnectionChanged,
     ControlNotification(ControlNotification),
     AudioNotification(Vec<u8>),
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +260,7 @@ impl AttachmentMonitor {
                         AtvvChange::AudioNotification(payload) => {
                             return Ok(Some(AtvvEvent::AudioNotification(payload)));
                         }
+                        AtvvChange::Stopped => return Ok(Some(AtvvEvent::Stopped)),
                         AtvvChange::TopologyChanged => continue,
                     }
                 }
@@ -284,12 +286,14 @@ impl AttachmentMonitor {
                     return Ok(Some(AtvvEvent::WaitingForRemote));
                 }
                 None => {
-                    if gatt
+                    let Some(change) = gatt
                         .wait_for_change_until(deadline)
                         .map_err(AttachmentError::Wait)?
-                        .is_none()
-                    {
+                    else {
                         return Ok(None);
+                    };
+                    if change == AtvvChange::Stopped {
+                        return Ok(Some(AtvvEvent::Stopped));
                     }
                 }
             }
@@ -771,6 +775,7 @@ where
             let at = self.boundaries.now();
             let operational_event = match event {
                 AtvvEvent::WaitingForRemote => {
+                    capture = None;
                     profile = None;
                     OperationalEvent::WaitingForRemote { at }
                 }

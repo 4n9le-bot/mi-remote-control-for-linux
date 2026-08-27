@@ -389,6 +389,88 @@ fn completed_capture_is_transcribed_committed_and_deleted() {
 }
 
 #[test]
+fn disconnect_discards_capture_before_reattachment() {
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            control_at(0, vec![0x04, 0x03, 0x02, 1]),
+            AtvvEvent::AudioNotification(vec![0x11; 120]),
+            AtvvEvent::WaitingForRemote,
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            control_at(1, vec![0x04, 0x03, 0x02, 2]),
+            AtvvEvent::AudioNotification(vec![0x22; 120]),
+            control_at(2, vec![0x00, 0x02]),
+            AtvvEvent::Stopped,
+        ]),
+        process_results: VecDeque::from([successful_process("")]),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("reattachment should leave the daemon usable");
+
+    assert_eq!(boundaries.commands.len(), 1);
+    assert_eq!(wav_samples(&boundaries).len(), 240);
+    assert_eq!(
+        boundaries
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                OperationalEvent::CaptureCompleted { stream_id, .. } => Some(*stream_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [2]
+    );
+}
+
+#[test]
+fn shutdown_discards_an_unfinished_capture() {
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            control_at(0, vec![0x04, 0x03, 0x02, 1]),
+            AtvvEvent::AudioNotification(vec![0x11; 120]),
+            AtvvEvent::Stopped,
+        ]),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("shutdown should stop cleanly");
+
+    assert!(boundaries.wav.is_none());
+    assert!(boundaries.commands.is_empty());
+    assert!(boundaries.removed_files.is_empty());
+    assert!(
+        !boundaries
+            .events
+            .iter()
+            .any(|event| matches!(event, OperationalEvent::CaptureCompleted { .. }))
+    );
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::DaemonStopped {
+                at: SystemTime::UNIX_EPOCH,
+            })
+    );
+}
+
+#[test]
 fn maximum_duration_hands_off_collected_audio_without_a_stop_notification() {
     let deadline = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
     let mut boundaries = ControlledBoundaries {

@@ -4,8 +4,11 @@ use std::{
     io,
     path::Path,
     process,
-    sync::atomic::{AtomicU64, Ordering},
     sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -28,6 +31,8 @@ pub struct SystemBoundaries {
     bluez: Option<zbus::blocking::Connection>,
     event_watch: Option<EventWatch>,
     notification_roles: HashMap<String, NotificationRole>,
+    shutdown_requested: Arc<AtomicBool>,
+    signal_handlers_installed: bool,
 }
 
 #[derive(Debug)]
@@ -50,6 +55,7 @@ enum NotificationRole {
 
 impl AtvvTransport for SystemBoundaries {
     fn next_event(&mut self, deadline: Option<SystemTime>) -> io::Result<Option<AtvvEvent>> {
+        self.ensure_signal_handlers()?;
         let mut attachment = std::mem::take(&mut self.attachment);
         let result = attachment
             .next_event(self, deadline)
@@ -206,6 +212,9 @@ impl AtvvGatt for SystemBoundaries {
         &mut self,
         deadline: Option<SystemTime>,
     ) -> io::Result<Option<AtvvChange>> {
+        if self.shutdown_requested.load(Ordering::Relaxed) {
+            return Ok(Some(AtvvChange::Stopped));
+        }
         let timeout = deadline
             .map(|deadline| {
                 deadline
@@ -213,15 +222,28 @@ impl AtvvGatt for SystemBoundaries {
                     .unwrap_or(Duration::ZERO)
             })
             .unwrap_or(Duration::MAX);
+        let poll_interval = timeout.min(Duration::from_millis(250));
         let Some(watch) = self.event_watch.as_ref() else {
-            thread::sleep(timeout.min(Duration::from_millis(250)));
-            return Ok(deadline
-                .is_none_or(|deadline| SystemTime::now() < deadline)
-                .then_some(AtvvChange::TopologyChanged));
+            thread::sleep(poll_interval);
+            return if self.shutdown_requested.load(Ordering::Relaxed) {
+                Ok(Some(AtvvChange::Stopped))
+            } else {
+                Ok(deadline
+                    .is_none_or(|deadline| SystemTime::now() < deadline)
+                    .then_some(AtvvChange::TopologyChanged))
+            };
         };
-        match watch.changes.recv_timeout(timeout) {
+        match watch.changes.recv_timeout(poll_interval) {
             Ok(change) => Ok(Some(change)),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if self.shutdown_requested.load(Ordering::Relaxed) {
+                    Ok(Some(AtvvChange::Stopped))
+                } else {
+                    Ok(deadline
+                        .is_none_or(|deadline| SystemTime::now() < deadline)
+                        .then_some(AtvvChange::TopologyChanged))
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "ATVV connection monitor stopped",
@@ -231,6 +253,24 @@ impl AtvvGatt for SystemBoundaries {
 }
 
 impl SystemBoundaries {
+    fn ensure_signal_handlers(&mut self) -> io::Result<()> {
+        if self.signal_handlers_installed {
+            return Ok(());
+        }
+        signal_hook::flag::register(
+            signal_hook::consts::signal::SIGINT,
+            self.shutdown_requested.clone(),
+        )
+        .map_err(io::Error::other)?;
+        signal_hook::flag::register(
+            signal_hook::consts::signal::SIGTERM,
+            self.shutdown_requested.clone(),
+        )
+        .map_err(io::Error::other)?;
+        self.signal_handlers_installed = true;
+        Ok(())
+    }
+
     fn bluez_connection(&mut self) -> io::Result<zbus::blocking::Connection> {
         if self.bluez.is_none() {
             self.bluez = Some(zbus::blocking::Connection::system().map_err(io::Error::other)?);
@@ -525,4 +565,37 @@ fn unix_millis(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, SystemTime},
+    };
+
+    use crate::{AtvvChange, AtvvGatt};
+
+    use super::SystemBoundaries;
+
+    #[test]
+    fn requested_shutdown_interrupts_topology_waiting() {
+        let shutdown_requested = Arc::new(AtomicBool::new(true));
+        let mut boundaries = SystemBoundaries {
+            shutdown_requested: shutdown_requested.clone(),
+            signal_handlers_installed: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            boundaries
+                .wait_for_change_until(Some(SystemTime::now() + Duration::from_secs(1)))
+                .expect("shutdown polling should remain healthy"),
+            Some(AtvvChange::Stopped)
+        );
+        assert!(shutdown_requested.load(Ordering::Relaxed));
+    }
 }
