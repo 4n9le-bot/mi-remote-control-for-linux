@@ -252,10 +252,7 @@ fn monitor_forwards_shutdown_while_waiting_for_a_remote() {
 #[test]
 fn gatt_removal_during_attachment_returns_to_waiting_and_retries() {
     let first = ready_snapshot();
-    let mut rebuilt = ready_snapshot();
-    for characteristic in &mut rebuilt.characteristics {
-        characteristic.path = characteristic.path.replace("char000", "char001");
-    }
+    let rebuilt = rebuilt_ready_snapshot();
     let mut gatt = VanishingGatt {
         snapshots: VecDeque::from([first, rebuilt.clone(), rebuilt]),
         subscribe_attempts: 0,
@@ -308,10 +305,7 @@ fn monitor_does_not_report_ready_when_capability_negotiation_fails() {
 #[test]
 fn rebuilt_gatt_endpoints_force_resubscription_and_renegotiation() {
     let first = ready_snapshot();
-    let mut rebuilt = ready_snapshot();
-    for characteristic in &mut rebuilt.characteristics {
-        characteristic.path = characteristic.path.replace("char000", "char001");
-    }
+    let rebuilt = rebuilt_ready_snapshot();
     let mut gatt = ControlledGatt {
         snapshots: VecDeque::from([first, rebuilt.clone(), rebuilt]),
         changes: VecDeque::new(),
@@ -347,10 +341,7 @@ fn rebuilt_gatt_endpoints_force_resubscription_and_renegotiation() {
 #[test]
 fn removed_gatt_objects_return_to_waiting_before_reattachment() {
     let first = ready_snapshot();
-    let mut rebuilt = ready_snapshot();
-    for characteristic in &mut rebuilt.characteristics {
-        characteristic.path = characteristic.path.replace("char000", "char001");
-    }
+    let rebuilt = rebuilt_ready_snapshot();
     let mut gatt = ControlledGatt {
         snapshots: VecDeque::from([first.clone(), first, BluezSnapshot::default(), rebuilt]),
         changes: VecDeque::from([AtvvChange::TopologyChanged]),
@@ -481,4 +472,12 @@ fn ready_snapshot() -> BluezSnapshot {
             })
             .collect(),
     }
+}
+
+fn rebuilt_ready_snapshot() -> BluezSnapshot {
+    let mut rebuilt = ready_snapshot();
+    for characteristic in &mut rebuilt.characteristics {
+        characteristic.path = characteristic.path.replace("char000", "char001");
+    }
+    rebuilt
 }
