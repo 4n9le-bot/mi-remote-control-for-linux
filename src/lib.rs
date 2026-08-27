@@ -803,6 +803,12 @@ struct Capture {
     started_at: SystemTime,
 }
 
+struct HandoffMetadata {
+    address: String,
+    duration: Duration,
+    audio_bytes: usize,
+}
+
 impl<B> RunningApplication<'_, B>
 where
     B: AtvvTransport + ProcessExecutor + Storage + Clock + OperationalEvents,
@@ -950,10 +956,13 @@ where
         if samples == 0 {
             return;
         }
+        let metadata = HandoffMetadata {
+            address: completed.address,
+            duration: at.duration_since(completed.started_at).unwrap_or_default(),
+            audio_bytes: completed.audio_bytes,
+        };
         self.perform_wav_handoff_and_text_commit(
-            &completed.address,
-            at.duration_since(completed.started_at).unwrap_or_default(),
-            completed.audio_bytes,
+            &metadata,
             completed.profile.sample_rate_hz(),
             &completed.samples,
         );
@@ -966,9 +975,7 @@ where
 
     fn perform_wav_handoff_and_text_commit(
         &mut self,
-        address: &str,
-        duration: Duration,
-        audio_bytes: usize,
+        metadata: &HandoffMetadata,
         sample_rate_hz: u32,
         samples: &[i16],
     ) {
@@ -979,15 +986,12 @@ where
         {
             Ok(path) => path,
             Err(error) => {
-                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
-                    at: self.boundaries.now(),
-                    address: address.into(),
-                    duration,
-                    audio_bytes,
-                    stage: IntegrationStage::WavCreation,
-                    error: format!("could not create private WAV: {error}"),
-                    retained_wav: None,
-                });
+                self.emit_handoff_failure(
+                    metadata,
+                    IntegrationStage::WavCreation,
+                    format!("could not create private WAV: {error}"),
+                    None,
+                );
                 return;
             }
         };
@@ -998,42 +1002,33 @@ where
         let output = match self.boundaries.execute(&transcription) {
             Ok(output) => output,
             Err(error) => {
-                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
-                    at: self.boundaries.now(),
-                    address: address.into(),
-                    duration,
-                    audio_bytes,
-                    stage: IntegrationStage::Transcription,
-                    error: format!("could not run voxtype: {error}"),
-                    retained_wav: Some(path),
-                });
+                self.emit_handoff_failure(
+                    metadata,
+                    IntegrationStage::Transcription,
+                    format!("could not run voxtype: {error}"),
+                    Some(path),
+                );
                 return;
             }
         };
         if output.status != 0 {
-            self.boundaries.emit(OperationalEvent::WavHandoffFailed {
-                at: self.boundaries.now(),
-                address: address.into(),
-                duration,
-                audio_bytes,
-                stage: IntegrationStage::Transcription,
-                error: format!("voxtype exited with status {}", output.status),
-                retained_wav: Some(path),
-            });
+            self.emit_handoff_failure(
+                metadata,
+                IntegrationStage::Transcription,
+                format!("voxtype exited with status {}", output.status),
+                Some(path),
+            );
             return;
         }
         let stdout = match String::from_utf8(output.stdout) {
             Ok(stdout) => stdout,
             Err(_) => {
-                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
-                    at: self.boundaries.now(),
-                    address: address.into(),
-                    duration,
-                    audio_bytes,
-                    stage: IntegrationStage::Transcription,
-                    error: "voxtype produced non-UTF-8 output".into(),
-                    retained_wav: Some(path),
-                });
+                self.emit_handoff_failure(
+                    metadata,
+                    IntegrationStage::Transcription,
+                    "voxtype produced non-UTF-8 output".into(),
+                    Some(path),
+                );
                 return;
             }
         };
@@ -1046,28 +1041,22 @@ where
             let output = match self.boundaries.execute(&commit) {
                 Ok(output) => output,
                 Err(error) => {
-                    self.boundaries.emit(OperationalEvent::WavHandoffFailed {
-                        at: self.boundaries.now(),
-                        address: address.into(),
-                        duration,
-                        audio_bytes,
-                        stage: IntegrationStage::TextCommit,
-                        error: format!("could not run fcitx5-commit: {error}"),
-                        retained_wav: Some(path),
-                    });
+                    self.emit_handoff_failure(
+                        metadata,
+                        IntegrationStage::TextCommit,
+                        format!("could not run fcitx5-commit: {error}"),
+                        Some(path),
+                    );
                     return;
                 }
             };
             if output.status != 0 {
-                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
-                    at: self.boundaries.now(),
-                    address: address.into(),
-                    duration,
-                    audio_bytes,
-                    stage: IntegrationStage::TextCommit,
-                    error: format!("fcitx5-commit exited with status {}", output.status),
-                    retained_wav: Some(path),
-                });
+                self.emit_handoff_failure(
+                    metadata,
+                    IntegrationStage::TextCommit,
+                    format!("fcitx5-commit exited with status {}", output.status),
+                    Some(path),
+                );
                 return;
             }
             WavHandoffOutcome::TextCommitted
@@ -1076,25 +1065,40 @@ where
         };
         if !self.config.keep_wav {
             if let Err(error) = self.boundaries.remove_file(&path) {
-                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
-                    at: self.boundaries.now(),
-                    address: address.into(),
-                    duration,
-                    audio_bytes,
-                    stage: IntegrationStage::WavCleanup,
-                    error: format!("could not delete successful WAV: {error}"),
-                    retained_wav: Some(path),
-                });
+                self.emit_handoff_failure(
+                    metadata,
+                    IntegrationStage::WavCleanup,
+                    format!("could not delete successful WAV: {error}"),
+                    Some(path),
+                );
                 return;
             }
         }
         self.boundaries.emit(OperationalEvent::WavHandoffSucceeded {
             at: self.boundaries.now(),
-            address: address.into(),
-            duration,
-            audio_bytes,
+            address: metadata.address.clone(),
+            duration: metadata.duration,
+            audio_bytes: metadata.audio_bytes,
             outcome,
             retained_wav: self.config.keep_wav.then_some(path),
+        });
+    }
+
+    fn emit_handoff_failure(
+        &mut self,
+        metadata: &HandoffMetadata,
+        stage: IntegrationStage,
+        error: String,
+        retained_wav: Option<PathBuf>,
+    ) {
+        self.boundaries.emit(OperationalEvent::WavHandoffFailed {
+            at: self.boundaries.now(),
+            address: metadata.address.clone(),
+            duration: metadata.duration,
+            audio_bytes: metadata.audio_bytes,
+            stage,
+            error,
+            retained_wav,
         });
     }
 }
@@ -1102,16 +1106,15 @@ where
 fn voxtype_transcript(stdout: &str) -> Option<&str> {
     const NO_SPEECH: &str = "No speech detected, skipping transcription.";
 
-    if let Some((_, transcript)) = stdout.split_once("\n\n") {
+    let output = stdout.trim();
+    if output.is_empty() || output.lines().last() == Some(NO_SPEECH) {
+        return None;
+    }
+    if stdout.trim_start().starts_with("Loading audio file:")
+        && let Some((_, transcript)) = stdout.split_once("\n\n")
+    {
         let transcript = transcript.trim();
         return (!transcript.is_empty()).then_some(transcript);
-    }
-    let output = stdout.trim();
-    if output.is_empty() {
-        return None;
-    }
-    if output.lines().last() == Some(NO_SPEECH) {
-        return None;
     }
     Some(output)
 }

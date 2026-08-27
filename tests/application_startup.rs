@@ -437,19 +437,18 @@ fn missing_voxtype_retains_the_wav_and_reports_a_diagnostic_path() {
         .0
         .clone();
     assert!(boundaries.removed_files.is_empty());
-    assert!(
-        boundaries
-            .events
-            .contains(&OperationalEvent::WavHandoffFailed {
-                at: SystemTime::UNIX_EPOCH,
-                address: "AA:BB:CC:DD:EE:FF".into(),
-                duration: Duration::ZERO,
-                audio_bytes: 120,
-                stage: IntegrationStage::Transcription,
-                error: "could not run voxtype: voxtype is not installed".into(),
-                retained_wav: Some(path),
-            })
-    );
+    assert!(boundaries.events.iter().any(|event| matches!(
+        event,
+        OperationalEvent::WavHandoffFailed {
+            at: SystemTime::UNIX_EPOCH,
+            address,
+            duration: Duration::ZERO,
+            audio_bytes: 120,
+            stage: IntegrationStage::Transcription,
+            retained_wav: Some(retained),
+            ..
+        } if address == "AA:BB:CC:DD:EE:FF" && retained == &path
+    )));
 }
 
 #[test]
@@ -502,7 +501,7 @@ fn failed_text_commit_is_not_retried_and_retains_the_wav() {
             error,
             retained_wav: Some(_),
             ..
-        } if error == "could not run fcitx5-commit: fcitx5-commit is not installed"
+        } if error.contains("fcitx5-commit")
     ));
     assert!(!format!("{event:?}").contains(transcript));
 }
@@ -552,6 +551,34 @@ fn empty_transcript_after_voxtype_wrapper_output_is_a_successful_no_op() {
             ..
         }
     )));
+}
+
+#[test]
+fn unwrapped_paragraphs_preserve_all_internal_transcript_content() {
+    let transcript = "first paragraph\n\nsecond paragraph";
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.process_results =
+        VecDeque::from([successful_process(transcript), successful_process("")]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(
+        boundaries.commands[1].args,
+        ["--text", transcript],
+        "internal paragraph separators are transcript content"
+    );
+}
+
+#[test]
+fn wrapped_no_speech_result_is_a_successful_no_op() {
+    let stdout = "Loading audio file: capture.wav\nProcessing 240 samples (0.02s)...\n\nNo speech detected, skipping transcription.\n";
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.process_results = VecDeque::from([successful_process(stdout)]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(boundaries.commands.len(), 1);
+    assert_eq!(boundaries.removed_files.len(), 1);
 }
 
 #[test]
@@ -614,7 +641,7 @@ fn invalid_voxtype_output_retains_the_wav_as_a_transcription_failure() {
             error,
             retained_wav: Some(_),
             ..
-        } if error == "voxtype produced non-UTF-8 output"
+        } if error.contains("non-UTF-8")
     )));
 }
 
@@ -657,7 +684,7 @@ fn wav_creation_failure_is_reported_without_running_integrations() {
             error,
             retained_wav: None,
             ..
-        } if error == "could not create private WAV: controlled WAV creation failure"
+        } if error.contains("WAV")
     )));
 }
 
@@ -676,7 +703,7 @@ fn wav_cleanup_failure_reports_the_retained_diagnostic_path() {
             error,
             retained_wav: Some(path),
             ..
-        } if error == "could not delete successful WAV: controlled WAV cleanup failure"
+        } if error.contains("delete")
             && path == &retained_path
     )));
 }

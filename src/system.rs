@@ -479,27 +479,15 @@ impl Storage for SystemBoundaries {
     ) -> io::Result<std::path::PathBuf> {
         use std::io::Write;
 
-        for _ in 0..16 {
-            let sequence = UNIQUE_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = directory.join(format!("capture-{}-{sequence}.wav", process::id()));
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            match options.open(&path) {
-                Ok(mut file) => {
-                    file.write_all(contents)?;
-                    file.sync_all()?;
-                    return Ok(path);
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a private WAV path",
-        ))
+        let mut file = tempfile::Builder::new()
+            .prefix("capture-")
+            .suffix(".wav")
+            .tempfile_in(directory)?;
+        file.write_all(contents)?;
+        file.as_file().sync_all()?;
+        file.keep()
+            .map(|(_, path)| path)
+            .map_err(|error| error.error)
     }
 
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {
