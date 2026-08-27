@@ -7,8 +7,8 @@ use std::{
 
 use atvv_bridge::{
     Application, AtvvEvent, AtvvTransport, AudioNotificationIssue, Clock, Command, CommandOutput,
-    ConfigSelection, ControlNotification, ControlNotificationIssue, OperationalEvent,
-    OperationalEvents, ProcessExecutor, Storage,
+    ConfigSelection, ControlNotification, ControlNotificationIssue, IntegrationStage,
+    OperationalEvent, OperationalEvents, ProcessExecutor, Storage, WavHandoffOutcome,
 };
 
 #[derive(Default)]
@@ -16,11 +16,14 @@ struct ControlledBoundaries {
     config: Option<String>,
     prepared_wav_dir: Option<String>,
     prepare_error: Option<io::ErrorKind>,
+    create_error: Option<io::ErrorKind>,
+    remove_error: Option<io::ErrorKind>,
     atvv_events: VecDeque<AtvvEvent>,
     process_results: VecDeque<io::Result<CommandOutput>>,
     commands: Vec<Command>,
     events: Vec<OperationalEvent>,
     wav: Option<(PathBuf, Vec<u8>)>,
+    created_wavs: Vec<(PathBuf, Vec<u8>)>,
     removed_files: Vec<PathBuf>,
     now: Duration,
     observed_deadlines: Vec<Option<SystemTime>>,
@@ -85,14 +88,24 @@ impl Storage for ControlledBoundaries {
     }
 
     fn create_private_wav(&mut self, _directory: &Path, contents: &[u8]) -> io::Result<PathBuf> {
+        if let Some(kind) = self.create_error {
+            return Err(io::Error::new(kind, "controlled WAV creation failure"));
+        }
         self.now += self.wav_creation_duration;
         self.wav_creation_duration = Duration::ZERO;
-        let path = PathBuf::from("/tmp/atvv-bridge/capture-test.wav");
+        let path = PathBuf::from(format!(
+            "/tmp/atvv-bridge/capture-test-{}.wav",
+            self.created_wavs.len()
+        ));
         self.wav = Some((path.clone(), contents.to_vec()));
+        self.created_wavs.push((path.clone(), contents.to_vec()));
         Ok(path)
     }
 
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+        if let Some(kind) = self.remove_error {
+            return Err(io::Error::new(kind, "controlled WAV cleanup failure"));
+        }
         self.removed_files.push(path.to_owned());
         Ok(())
     }
@@ -314,7 +327,7 @@ fn scripted_atvv_transport_drives_observable_daemon_behavior() {
 #[test]
 fn completed_capture_is_transcribed_committed_and_deleted() {
     let frame = vec![0x11; 120];
-    let transcript = "quotes ' \"; $(still-data)\nsecond line";
+    let transcript = "quotes ' \"; $(still-data)\nsecond line\n\nfinal paragraph";
     let mut boundaries = ControlledBoundaries {
         atvv_events: VecDeque::from([
             AtvvEvent::RemoteReady {
@@ -329,7 +342,10 @@ fn completed_capture_is_transcribed_committed_and_deleted() {
         process_results: VecDeque::from([
             Ok(CommandOutput {
                 status: 0,
-                stdout: format!("\n  {transcript}\t\n").into_bytes(),
+                stdout: format!(
+                    "Loading audio file: capture.wav\nProcessing 240 samples (0.02s)...\n\n  {transcript}\t\n"
+                )
+                .into_bytes(),
                 stderr: Vec::new(),
             }),
             Ok(CommandOutput {
@@ -386,6 +402,283 @@ fn completed_capture_is_transcribed_committed_and_deleted() {
             samples: 240,
         }]
     );
+    let handoff_event = boundaries
+        .events
+        .iter()
+        .find(|event| matches!(event, OperationalEvent::WavHandoffSucceeded { .. }))
+        .expect("successful handoff should emit diagnostics");
+    assert!(matches!(
+        handoff_event,
+        OperationalEvent::WavHandoffSucceeded {
+            address,
+            audio_bytes: 120,
+            outcome: WavHandoffOutcome::TextCommitted,
+            retained_wav: None,
+            ..
+        } if address == "AA:BB:CC:DD:EE:FF"
+    ));
+    assert!(!format!("{handoff_event:?}").contains(transcript));
+}
+
+#[test]
+fn missing_voxtype_retains_the_wav_and_reports_a_diagnostic_path() {
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.process_results = VecDeque::from([Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "voxtype is not installed",
+    ))]);
+
+    run_capture(&mut boundaries);
+
+    let path = boundaries
+        .wav
+        .as_ref()
+        .expect("failed transcription should retain its WAV")
+        .0
+        .clone();
+    assert!(boundaries.removed_files.is_empty());
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::WavHandoffFailed {
+                at: SystemTime::UNIX_EPOCH,
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                duration: Duration::ZERO,
+                audio_bytes: 120,
+                stage: IntegrationStage::Transcription,
+                error: "could not run voxtype: voxtype is not installed".into(),
+                retained_wav: Some(path),
+            })
+    );
+}
+
+#[test]
+fn failed_transcription_retains_the_wav_without_logging_process_output() {
+    let transcript_marker = "PRIVATE TRANSCRIPT MARKER";
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.process_results = VecDeque::from([Ok(CommandOutput {
+        status: 23,
+        stdout: transcript_marker.as_bytes().to_vec(),
+        stderr: transcript_marker.as_bytes().to_vec(),
+    })]);
+
+    run_capture(&mut boundaries);
+
+    let event = boundaries
+        .events
+        .iter()
+        .find(|event| matches!(event, OperationalEvent::WavHandoffFailed { .. }))
+        .expect("failed transcription should be diagnostic");
+    assert!(format!("{event:?}").contains("status 23"));
+    assert!(!format!("{event:?}").contains(transcript_marker));
+    assert!(boundaries.removed_files.is_empty());
+}
+
+#[test]
+fn failed_text_commit_is_not_retried_and_retains_the_wav() {
+    let transcript = "do not log this transcript";
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.process_results = VecDeque::from([
+        successful_process(transcript),
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "fcitx5-commit is not installed",
+        )),
+    ]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(boundaries.commands.len(), 2, "Text Commit must not retry");
+    assert!(boundaries.removed_files.is_empty());
+    let event = boundaries
+        .events
+        .iter()
+        .find(|event| matches!(event, OperationalEvent::WavHandoffFailed { .. }))
+        .expect("failed Text Commit should be diagnostic");
+    assert!(matches!(
+        event,
+        OperationalEvent::WavHandoffFailed {
+            stage: IntegrationStage::TextCommit,
+            error,
+            retained_wav: Some(_),
+            ..
+        } if error == "could not run fcitx5-commit: fcitx5-commit is not installed"
+    ));
+    assert!(!format!("{event:?}").contains(transcript));
+}
+
+#[test]
+fn voxtype_no_speech_result_is_a_successful_no_op() {
+    let stdout = "Loading audio file: \"capture.wav\"\n\
+Audio format: 16000 Hz, 1 channel(s), Int\n\
+Processing 240 samples (0.02s)...\n\
+VAD: 0.00s speech (0.0% of audio)\n\
+No speech detected, skipping transcription.\n";
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.process_results = VecDeque::from([successful_process(stdout)]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(boundaries.commands.len(), 1);
+    assert_eq!(boundaries.removed_files.len(), 1);
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::WavHandoffSucceeded {
+                at: SystemTime::UNIX_EPOCH,
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                duration: Duration::ZERO,
+                audio_bytes: 120,
+                outcome: WavHandoffOutcome::NoSpeech,
+                retained_wav: None,
+            })
+    );
+}
+
+#[test]
+fn empty_transcript_after_voxtype_wrapper_output_is_a_successful_no_op() {
+    let stdout = "Loading audio file: capture.wav\nProcessing 240 samples (0.02s)...\n\n\n";
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.process_results = VecDeque::from([successful_process(stdout)]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(boundaries.commands.len(), 1);
+    assert_eq!(boundaries.removed_files.len(), 1);
+    assert!(boundaries.events.iter().any(|event| matches!(
+        event,
+        OperationalEvent::WavHandoffSucceeded {
+            outcome: WavHandoffOutcome::NoSpeech,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn missing_integration_is_resolved_again_for_the_next_capture() {
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            control_at(0, vec![0x04, 0x03, 0x02, 1]),
+            AtvvEvent::AudioNotification(vec![0x11; 120]),
+            control_at(0, vec![0x00, 0x02]),
+            control_at(1, vec![0x04, 0x03, 0x02, 2]),
+            AtvvEvent::AudioNotification(vec![0x22; 120]),
+            control_at(1, vec![0x00, 0x02]),
+            AtvvEvent::Stopped,
+        ]),
+        process_results: VecDeque::from([
+            Err(io::Error::new(io::ErrorKind::NotFound, "voxtype missing")),
+            successful_process(""),
+        ]),
+        ..Default::default()
+    };
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(
+        boundaries
+            .commands
+            .iter()
+            .map(|command| command.program.as_str())
+            .collect::<Vec<_>>(),
+        ["voxtype", "voxtype"]
+    );
+    assert_eq!(boundaries.created_wavs.len(), 2);
+    assert_eq!(
+        boundaries.removed_files,
+        [boundaries.created_wavs[1].0.clone()]
+    );
+    assert_ne!(boundaries.removed_files[0], boundaries.created_wavs[0].0);
+}
+
+#[test]
+fn invalid_voxtype_output_retains_the_wav_as_a_transcription_failure() {
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.process_results = VecDeque::from([Ok(CommandOutput {
+        status: 0,
+        stdout: vec![0xff],
+        stderr: Vec::new(),
+    })]);
+
+    run_capture(&mut boundaries);
+
+    assert!(boundaries.removed_files.is_empty());
+    assert!(boundaries.events.iter().any(|event| matches!(
+        event,
+        OperationalEvent::WavHandoffFailed {
+            stage: IntegrationStage::Transcription,
+            error,
+            retained_wav: Some(_),
+            ..
+        } if error == "voxtype produced non-UTF-8 output"
+    )));
+}
+
+#[test]
+fn keep_wav_retains_a_successful_completed_capture() {
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.config = Some("keep_wav = true\n".into());
+
+    Application::start(
+        ConfigSelection::Explicit("/etc/atvv-bridge.toml".into()),
+        &mut boundaries,
+    )
+    .expect("startup should succeed")
+    .run()
+    .expect("the Capture should leave the daemon usable");
+
+    let retained_path = boundaries.created_wavs[0].0.clone();
+    assert!(boundaries.removed_files.is_empty());
+    assert!(boundaries.events.iter().any(|event| matches!(
+        event,
+        OperationalEvent::WavHandoffSucceeded {
+            retained_wav: Some(path),
+            ..
+        } if path == &retained_path
+    )));
+}
+
+#[test]
+fn wav_creation_failure_is_reported_without_running_integrations() {
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.create_error = Some(io::ErrorKind::PermissionDenied);
+
+    run_capture(&mut boundaries);
+
+    assert!(boundaries.commands.is_empty());
+    assert!(boundaries.events.iter().any(|event| matches!(
+        event,
+        OperationalEvent::WavHandoffFailed {
+            stage: IntegrationStage::WavCreation,
+            error,
+            retained_wav: None,
+            ..
+        } if error == "could not create private WAV: controlled WAV creation failure"
+    )));
+}
+
+#[test]
+fn wav_cleanup_failure_reports_the_retained_diagnostic_path() {
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.remove_error = Some(io::ErrorKind::PermissionDenied);
+
+    run_capture(&mut boundaries);
+
+    let retained_path = boundaries.created_wavs[0].0.clone();
+    assert!(boundaries.events.iter().any(|event| matches!(
+        event,
+        OperationalEvent::WavHandoffFailed {
+            stage: IntegrationStage::WavCleanup,
+            error,
+            retained_wav: Some(path),
+            ..
+        } if error == "could not delete successful WAV: controlled WAV cleanup failure"
+            && path == &retained_path
+    )));
 }
 
 #[test]
@@ -512,6 +805,18 @@ fn maximum_duration_hands_off_collected_audio_without_a_stop_notification() {
                 at: deadline,
                 stream_id: 0x65,
                 samples: 240,
+            })
+    );
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::WavHandoffSucceeded {
+                at: deadline,
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                duration: Duration::from_secs(2),
+                audio_bytes: 120,
+                outcome: WavHandoffOutcome::NoSpeech,
+                retained_wav: None,
             })
     );
 }

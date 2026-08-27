@@ -559,10 +559,39 @@ impl OperationalEvents for SystemBoundaries {
             OperationalEvent::DecoderSynchronized { at } => {
                 eprintln!("event=decoder_synchronized at_unix_ms={}", unix_millis(at))
             }
-            OperationalEvent::WavCleanupFailed { at, path } => eprintln!(
-                "event=wav_cleanup_failed at_unix_ms={} retained_wav={:?}",
+            OperationalEvent::WavHandoffFailed {
+                at,
+                address,
+                duration,
+                audio_bytes,
+                stage,
+                error,
+                retained_wav,
+            } => eprintln!(
+                "event=wav_handoff_failed at_unix_ms={} state=idle address={:?} duration_ms={} audio_bytes={} stage={:?} error={:?} retained_wav={:?}",
                 unix_millis(at),
-                path
+                address,
+                duration.as_millis(),
+                audio_bytes,
+                stage,
+                error,
+                retained_wav
+            ),
+            OperationalEvent::WavHandoffSucceeded {
+                at,
+                address,
+                duration,
+                audio_bytes,
+                outcome,
+                retained_wav,
+            } => eprintln!(
+                "event=wav_handoff_succeeded at_unix_ms={} state=idle address={:?} duration_ms={} audio_bytes={} outcome={:?} retained_wav={:?}",
+                unix_millis(at),
+                address,
+                duration.as_millis(),
+                audio_bytes,
+                outcome,
+                retained_wav
             ),
             OperationalEvent::DaemonStopped { at } => {
                 eprintln!("event=daemon_stopped at_unix_ms={}", unix_millis(at))

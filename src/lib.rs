@@ -535,13 +535,40 @@ pub enum OperationalEvent {
     DecoderSynchronized {
         at: SystemTime,
     },
-    WavCleanupFailed {
+    WavHandoffFailed {
         at: SystemTime,
-        path: PathBuf,
+        address: String,
+        duration: Duration,
+        audio_bytes: usize,
+        stage: IntegrationStage,
+        error: String,
+        retained_wav: Option<PathBuf>,
+    },
+    WavHandoffSucceeded {
+        at: SystemTime,
+        address: String,
+        duration: Duration,
+        audio_bytes: usize,
+        outcome: WavHandoffOutcome,
+        retained_wav: Option<PathBuf>,
     },
     DaemonStopped {
         at: SystemTime,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrationStage {
+    WavCreation,
+    Transcription,
+    TextCommit,
+    WavCleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WavHandoffOutcome {
+    NoSpeech,
+    TextCommitted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -768,9 +795,11 @@ impl ImaAdpcmDecoder {
 
 struct Capture {
     stream_id: u8,
+    address: String,
     profile: AtvvProfile,
     decoder: ImaAdpcmDecoder,
     samples: Vec<i16>,
+    audio_bytes: usize,
     started_at: SystemTime,
 }
 
@@ -785,6 +814,7 @@ where
     pub fn run(mut self) -> Result<(), RunError> {
         let mut capture: Option<Capture> = None;
         let mut profile: Option<AtvvProfile> = None;
+        let mut remote_address: Option<String> = None;
         let mut reject_starts_received_through: Option<SystemTime> = None;
         loop {
             let deadline = capture.as_ref().map(|capture| {
@@ -807,6 +837,7 @@ where
                 AtvvEvent::WaitingForRemote => {
                     capture = None;
                     profile = None;
+                    remote_address = None;
                     OperationalEvent::WaitingForRemote { at }
                 }
                 AtvvEvent::RemoteReady {
@@ -814,6 +845,7 @@ where
                     profile: negotiated_profile,
                 } => {
                     profile = Some(negotiated_profile);
+                    remote_address = Some(address.clone());
                     OperationalEvent::RemoteReady { at, address }
                 }
                 AtvvEvent::ControlNotification(notification) => {
@@ -830,9 +862,13 @@ where
                         ControlMessage::Start { stream_id } if profile.is_some() => {
                             capture = Some(Capture {
                                 stream_id,
+                                address: remote_address
+                                    .clone()
+                                    .expect("ready profile has an ATVV Remote address"),
                                 profile: profile.expect("profile checked before Capture"),
                                 decoder: ImaAdpcmDecoder::default(),
                                 samples: Vec::new(),
+                                audio_bytes: 0,
                                 started_at: notification.received_at,
                             });
                             None
@@ -884,6 +920,7 @@ where
                                     },
                                 });
                         } else if let Some(active) = capture.as_mut() {
+                            active.audio_bytes += frame.len();
                             active.samples.extend(active.decoder.decode(&frame));
                         }
                     }
@@ -914,6 +951,9 @@ where
             return;
         }
         self.perform_wav_handoff_and_text_commit(
+            &completed.address,
+            at.duration_since(completed.started_at).unwrap_or_default(),
+            completed.audio_bytes,
             completed.profile.sample_rate_hz(),
             &completed.samples,
         );
@@ -924,46 +964,156 @@ where
         });
     }
 
-    fn perform_wav_handoff_and_text_commit(&mut self, sample_rate_hz: u32, samples: &[i16]) {
+    fn perform_wav_handoff_and_text_commit(
+        &mut self,
+        address: &str,
+        duration: Duration,
+        audio_bytes: usize,
+        sample_rate_hz: u32,
+        samples: &[i16],
+    ) {
         let wav = pcm16_wav(sample_rate_hz, samples);
-        let Ok(path) = self
+        let path = match self
             .boundaries
             .create_private_wav(&self.config.wav_dir, &wav)
-        else {
-            return;
+        {
+            Ok(path) => path,
+            Err(error) => {
+                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
+                    at: self.boundaries.now(),
+                    address: address.into(),
+                    duration,
+                    audio_bytes,
+                    stage: IntegrationStage::WavCreation,
+                    error: format!("could not create private WAV: {error}"),
+                    retained_wav: None,
+                });
+                return;
+            }
         };
         let transcription = Command {
             program: "voxtype".into(),
             args: vec!["transcribe".into(), path.display().to_string()],
         };
-        let Ok(output) = self.boundaries.execute(&transcription) else {
-            return;
+        let output = match self.boundaries.execute(&transcription) {
+            Ok(output) => output,
+            Err(error) => {
+                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
+                    at: self.boundaries.now(),
+                    address: address.into(),
+                    duration,
+                    audio_bytes,
+                    stage: IntegrationStage::Transcription,
+                    error: format!("could not run voxtype: {error}"),
+                    retained_wav: Some(path),
+                });
+                return;
+            }
         };
         if output.status != 0 {
+            self.boundaries.emit(OperationalEvent::WavHandoffFailed {
+                at: self.boundaries.now(),
+                address: address.into(),
+                duration,
+                audio_bytes,
+                stage: IntegrationStage::Transcription,
+                error: format!("voxtype exited with status {}", output.status),
+                retained_wav: Some(path),
+            });
             return;
         }
-        let Ok(stdout) = String::from_utf8(output.stdout) else {
-            return;
+        let stdout = match String::from_utf8(output.stdout) {
+            Ok(stdout) => stdout,
+            Err(_) => {
+                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
+                    at: self.boundaries.now(),
+                    address: address.into(),
+                    duration,
+                    audio_bytes,
+                    stage: IntegrationStage::Transcription,
+                    error: "voxtype produced non-UTF-8 output".into(),
+                    retained_wav: Some(path),
+                });
+                return;
+            }
         };
-        let transcript = stdout.trim();
-        if !transcript.is_empty() {
+        let transcript = voxtype_transcript(&stdout);
+        let outcome = if let Some(transcript) = transcript {
             let commit = Command {
                 program: "fcitx5-commit".into(),
                 args: vec!["--text".into(), transcript.into()],
             };
-            let Ok(output) = self.boundaries.execute(&commit) else {
-                return;
+            let output = match self.boundaries.execute(&commit) {
+                Ok(output) => output,
+                Err(error) => {
+                    self.boundaries.emit(OperationalEvent::WavHandoffFailed {
+                        at: self.boundaries.now(),
+                        address: address.into(),
+                        duration,
+                        audio_bytes,
+                        stage: IntegrationStage::TextCommit,
+                        error: format!("could not run fcitx5-commit: {error}"),
+                        retained_wav: Some(path),
+                    });
+                    return;
+                }
             };
             if output.status != 0 {
+                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
+                    at: self.boundaries.now(),
+                    address: address.into(),
+                    duration,
+                    audio_bytes,
+                    stage: IntegrationStage::TextCommit,
+                    error: format!("fcitx5-commit exited with status {}", output.status),
+                    retained_wav: Some(path),
+                });
+                return;
+            }
+            WavHandoffOutcome::TextCommitted
+        } else {
+            WavHandoffOutcome::NoSpeech
+        };
+        if !self.config.keep_wav {
+            if let Err(error) = self.boundaries.remove_file(&path) {
+                self.boundaries.emit(OperationalEvent::WavHandoffFailed {
+                    at: self.boundaries.now(),
+                    address: address.into(),
+                    duration,
+                    audio_bytes,
+                    stage: IntegrationStage::WavCleanup,
+                    error: format!("could not delete successful WAV: {error}"),
+                    retained_wav: Some(path),
+                });
                 return;
             }
         }
-        if !self.config.keep_wav && self.boundaries.remove_file(&path).is_err() {
-            let at = self.boundaries.now();
-            self.boundaries
-                .emit(OperationalEvent::WavCleanupFailed { at, path });
-        }
+        self.boundaries.emit(OperationalEvent::WavHandoffSucceeded {
+            at: self.boundaries.now(),
+            address: address.into(),
+            duration,
+            audio_bytes,
+            outcome,
+            retained_wav: self.config.keep_wav.then_some(path),
+        });
     }
+}
+
+fn voxtype_transcript(stdout: &str) -> Option<&str> {
+    const NO_SPEECH: &str = "No speech detected, skipping transcription.";
+
+    if let Some((_, transcript)) = stdout.split_once("\n\n") {
+        let transcript = transcript.trim();
+        return (!transcript.is_empty()).then_some(transcript);
+    }
+    let output = stdout.trim();
+    if output.is_empty() {
+        return None;
+    }
+    if output.lines().last() == Some(NO_SPEECH) {
+        return None;
+    }
+    Some(output)
 }
 
 fn pcm16_wav(sample_rate_hz: u32, samples: &[i16]) -> Vec<u8> {
