@@ -43,6 +43,13 @@ Package installation deliberately does not enable or start the service. The
 unit runs as the current user and becomes part of that user's `default.target`
 only after the explicit `systemctl --user enable` command.
 
+The package also installs a hardware database entry for the Xiaomi Bluetooth
+Remote Control 2 Pro (`2717:32b8`). It maps only the voice button's HID scan
+code to `KEY_RESERVED`, preventing its repeating F5 terminal sequence from
+inserting `~` characters while leaving the other remote buttons unchanged.
+Reconnect the remote after installing or removing the package so the mapping
+is applied to the new input device.
+
 Inspect the service with:
 
 ```sh

@@ -28,6 +28,8 @@ cargo build --manifest-path "$repo_dir/Cargo.toml" --release --locked
 package_root="$build_dir/debian/$package_name"
 install -Dm755 "$target_dir/release/atvv-bridge" \
     "$package_root/usr/bin/atvv-bridge"
+install -Dm644 "$repo_dir/packaging/90-atvv-bridge.hwdb" \
+    "$package_root/usr/lib/udev/hwdb.d/90-atvv-bridge.hwdb"
 install -Dm644 "$repo_dir/packaging/atvv-bridge.service" \
     "$package_root/usr/lib/systemd/user/atvv-bridge.service"
 install -Dm644 "$repo_dir/README.md" \

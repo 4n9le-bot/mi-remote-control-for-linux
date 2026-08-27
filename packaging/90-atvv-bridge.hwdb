@@ -1,0 +1,3 @@
+# Xiaomi Bluetooth Remote Control 2 Pro
+evdev:input:b0005v2717p32B8*
+ KEYBOARD_KEY_7003e=reserved

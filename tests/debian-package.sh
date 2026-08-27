@@ -18,6 +18,7 @@ test -n "$package"
 
 contents=$(dpkg-deb --contents "$package")
 grep -Eq '[[:space:]]\./usr/bin/atvv-bridge$' <<<"$contents"
+grep -Eq '[[:space:]]\./usr/lib/udev/hwdb.d/90-atvv-bridge.hwdb$' <<<"$contents"
 grep -Eq '[[:space:]]\./usr/lib/systemd/user/atvv-bridge.service$' <<<"$contents"
 grep -Eq '[[:space:]]\./usr/share/doc/atvv-bridge/README.md$' <<<"$contents"
 
@@ -39,6 +40,11 @@ fakeroot dpkg --root="$install_root" --admindir="$admin_dir" --log=/dev/null \
     --force-bad-path --unpack "$package"
 test ! -e "$install_root/etc/systemd/user/default.target.wants/atvv-bridge.service"
 
+systemd-hwdb --root="$install_root" --strict update
+remote_modalias='evdev:input:b0005v2717p32B8e00A4-e0,1,4,14,k71,72,73,74,75'
+remote_properties=$(systemd-hwdb --root="$install_root" query "$remote_modalias")
+grep -Fxq 'KEYBOARD_KEY_7003e=reserved' <<<"$remote_properties"
+
 unit="$install_root/usr/lib/systemd/user/atvv-bridge.service"
 grep -Fxq 'ExecStart=/usr/bin/atvv-bridge' "$unit"
 grep -Fxq 'Restart=on-failure' "$unit"
@@ -53,4 +59,5 @@ fakeroot dpkg --root="$install_root" --admindir="$admin_dir" --log=/dev/null \
 test -f "$user_state/retained.wav"
 test -f "$user_config"
 test ! -e "$install_root/usr/bin/atvv-bridge"
+test ! -e "$install_root/usr/lib/udev/hwdb.d/90-atvv-bridge.hwdb"
 test ! -e "$unit"
