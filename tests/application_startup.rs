@@ -6,9 +6,9 @@ use std::{
 };
 
 use atvv_bridge::{
-    Application, AtvvEvent, AtvvTransport, Clock, Command, CommandOutput, ConfigSelection,
-    ControlNotification, ControlNotificationIssue, OperationalEvent, OperationalEvents,
-    ProcessExecutor, Storage,
+    Application, AtvvEvent, AtvvTransport, AudioNotificationIssue, Clock, Command, CommandOutput,
+    ConfigSelection, ControlNotification, ControlNotificationIssue, OperationalEvent,
+    OperationalEvents, ProcessExecutor, Storage,
 };
 
 #[derive(Default)]
@@ -590,6 +590,132 @@ fn invalid_control_notifications_are_warned_and_do_not_corrupt_capture_state() {
 }
 
 #[test]
+fn malformed_audio_is_warned_and_does_not_change_decoder_state() {
+    let mut boundaries = capture_boundaries([
+        AtvvEvent::AudioNotification(vec![0x77; 120]),
+        AtvvEvent::AudioNotification(vec![0x00; 119]),
+        AtvvEvent::AudioNotification(vec![0x00; 120]),
+    ]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(wav_samples(&boundaries).len(), 480);
+    assert_eq!(wav_samples(&boundaries)[240], i16::MAX);
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::AudioNotificationIgnored {
+                at: SystemTime::UNIX_EPOCH,
+                issue: AudioNotificationIssue::Malformed {
+                    expected_bytes: 120,
+                    actual_bytes: 119,
+                },
+            })
+    );
+}
+
+#[test]
+fn malformed_audio_outside_a_capture_is_warned_without_stopping_the_daemon() {
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            AtvvEvent::AudioNotification(vec![0; 119]),
+            AtvvEvent::Stopped,
+        ]),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("malformed audio should not stop the daemon");
+
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::AudioNotificationIgnored {
+                at: SystemTime::UNIX_EPOCH,
+                issue: AudioNotificationIssue::Malformed {
+                    expected_bytes: 120,
+                    actual_bytes: 119,
+                },
+            })
+    );
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::DaemonStopped {
+                at: SystemTime::UNIX_EPOCH,
+            })
+    );
+}
+
+#[test]
+fn omitted_audio_notification_does_not_discard_capture_or_invent_loss_detection() {
+    let mut boundaries = capture_boundaries([
+        AtvvEvent::AudioNotification(vec![0x11; 120]),
+        AtvvEvent::AudioNotification(vec![0x11; 120]),
+    ]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(wav_samples(&boundaries).len(), 480);
+    assert!(!boundaries.events.iter().any(|event| matches!(
+        event,
+        OperationalEvent::AudioNotificationIgnored { .. }
+            | OperationalEvent::ControlNotificationIgnored { .. }
+    )));
+}
+
+#[test]
+fn valid_audio_sync_resets_decoder_state_for_later_headerless_audio() {
+    let mut boundaries = capture_boundaries([
+        AtvvEvent::AudioNotification(vec![0x77; 120]),
+        control_at(0, vec![0x0A, 0x02, 0x12, 0x34, 0x03, 0xE8, 20]),
+        AtvvEvent::AudioNotification({
+            let mut frame = vec![0; 120];
+            frame[0] = 0x35;
+            frame
+        }),
+    ]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(&wav_samples(&boundaries)[240..242], [1_043, 1_104]);
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::DecoderSynchronized {
+                at: SystemTime::UNIX_EPOCH,
+            })
+    );
+}
+
+#[test]
+fn invalid_audio_sync_is_warned_and_leaves_decoder_state_safe() {
+    let mut boundaries = capture_boundaries([
+        AtvvEvent::AudioNotification(vec![0x77; 120]),
+        control_at(0, vec![0x0A, 0x01, 0x00, 0x01, 0xFC, 0x18, 0]),
+        AtvvEvent::AudioNotification(vec![0x00; 120]),
+    ]);
+
+    run_capture(&mut boundaries);
+
+    assert_eq!(wav_samples(&boundaries)[240], i16::MAX);
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::ControlNotificationIgnored {
+                at: SystemTime::UNIX_EPOCH,
+                issue: ControlNotificationIssue::InvalidSynchronization,
+            })
+    );
+}
+
+#[test]
 fn empty_expired_and_normally_stopped_captures_run_no_external_commands() {
     let mut boundaries = ControlledBoundaries {
         config: Some("max_duration_secs = 2\n".into()),
@@ -642,4 +768,35 @@ fn successful_process(stdout: &str) -> io::Result<CommandOutput> {
         stdout: stdout.as_bytes().to_vec(),
         stderr: Vec::new(),
     })
+}
+
+fn capture_boundaries<const N: usize>(audio_events: [AtvvEvent; N]) -> ControlledBoundaries {
+    let mut atvv_events = VecDeque::from([
+        AtvvEvent::RemoteReady {
+            address: "AA:BB:CC:DD:EE:FF".into(),
+            profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+        },
+        control_at(0, vec![0x04, 0x03, 0x02, 1]),
+    ]);
+    atvv_events.extend(audio_events);
+    atvv_events.extend([control_at(0, vec![0x00, 0x02]), AtvvEvent::Stopped]);
+    ControlledBoundaries {
+        atvv_events,
+        process_results: VecDeque::from([successful_process("")]),
+        ..Default::default()
+    }
+}
+
+fn run_capture(boundaries: &mut ControlledBoundaries) {
+    Application::start(ConfigSelection::DefaultsOnly, boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("the Capture should leave the daemon usable");
+}
+
+fn wav_samples(boundaries: &ControlledBoundaries) -> Vec<i16> {
+    boundaries.wav.as_ref().expect("a WAV should be created").1[44..]
+        .chunks_exact(2)
+        .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect()
 }

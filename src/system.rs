@@ -501,6 +501,14 @@ impl OperationalEvents for SystemBoundaries {
                 unix_millis(at),
                 issue
             ),
+            OperationalEvent::AudioNotificationIgnored { at, issue } => eprintln!(
+                "event=audio_notification_ignored at_unix_ms={} issue={:?}",
+                unix_millis(at),
+                issue
+            ),
+            OperationalEvent::DecoderSynchronized { at } => {
+                eprintln!("event=decoder_synchronized at_unix_ms={}", unix_millis(at))
+            }
             OperationalEvent::WavCleanupFailed { at, path } => eprintln!(
                 "event=wav_cleanup_failed at_unix_ms={} retained_wav={:?}",
                 unix_millis(at),

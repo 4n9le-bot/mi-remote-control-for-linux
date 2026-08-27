@@ -494,6 +494,13 @@ pub enum OperationalEvent {
         at: SystemTime,
         issue: ControlNotificationIssue,
     },
+    AudioNotificationIgnored {
+        at: SystemTime,
+        issue: AudioNotificationIssue,
+    },
+    DecoderSynchronized {
+        at: SystemTime,
+    },
     WavCleanupFailed {
         at: SystemTime,
         path: PathBuf,
@@ -510,11 +517,22 @@ pub enum ControlNotificationIssue {
     OutOfOrder,
     Unknown,
     Malformed,
+    InvalidSynchronization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioNotificationIssue {
+    Malformed {
+        expected_bytes: usize,
+        actual_bytes: usize,
+    },
 }
 
 enum ControlMessage {
     Start { stream_id: u8 },
     Stop,
+    Synchronize { predictor: i16, step_index: u8 },
+    InvalidSynchronization,
     Malformed,
     Unknown,
 }
@@ -526,6 +544,11 @@ impl ControlMessage {
                 stream_id: *stream_id,
             },
             [0x00, 0x02] => Self::Stop,
+            [0x0A, 0x02, _, _, predictor_high, predictor_low, step_index] => Self::Synchronize {
+                predictor: i16::from_be_bytes([*predictor_high, *predictor_low]),
+                step_index: *step_index,
+            },
+            [0x0A, ..] => Self::InvalidSynchronization,
             [0x04, ..] | [0x00, ..] | [] => Self::Malformed,
             _ => Self::Unknown,
         }
@@ -662,6 +685,11 @@ pub struct ImaAdpcmDecoder {
 }
 
 impl ImaAdpcmDecoder {
+    pub fn reset(&mut self, predictor: i16, step_index: u8) {
+        self.predictor = i32::from(predictor);
+        self.step_index = i32::from(step_index.min(88));
+    }
+
     pub fn decode(&mut self, encoded: &[u8]) -> Vec<i16> {
         let mut samples = Vec::with_capacity(encoded.len() * 2);
         for byte in encoded {
@@ -783,7 +811,23 @@ where
                                 Some(ControlNotificationIssue::OutOfOrder)
                             }
                         }
+                        ControlMessage::Synchronize {
+                            predictor,
+                            step_index,
+                        } => {
+                            if let Some(active) = capture.as_mut() {
+                                active.decoder.reset(predictor, step_index);
+                                self.boundaries
+                                    .emit(OperationalEvent::DecoderSynchronized { at });
+                                None
+                            } else {
+                                Some(ControlNotificationIssue::OutOfOrder)
+                            }
+                        }
                         ControlMessage::Start { .. } => Some(ControlNotificationIssue::OutOfOrder),
+                        ControlMessage::InvalidSynchronization => {
+                            Some(ControlNotificationIssue::InvalidSynchronization)
+                        }
                         ControlMessage::Malformed => Some(ControlNotificationIssue::Malformed),
                         ControlMessage::Unknown => Some(ControlNotificationIssue::Unknown),
                     };
@@ -794,10 +838,19 @@ where
                     continue;
                 }
                 AtvvEvent::AudioNotification(frame) => {
-                    if let Some(active) = capture.as_mut()
-                        && frame.len() == active.profile.frame_bytes()
-                    {
-                        active.samples.extend(active.decoder.decode(&frame));
+                    if let Some(expected_bytes) = profile.map(AtvvProfile::frame_bytes) {
+                        if frame.len() != expected_bytes {
+                            self.boundaries
+                                .emit(OperationalEvent::AudioNotificationIgnored {
+                                    at,
+                                    issue: AudioNotificationIssue::Malformed {
+                                        expected_bytes,
+                                        actual_bytes: frame.len(),
+                                    },
+                                });
+                        } else if let Some(active) = capture.as_mut() {
+                            active.samples.extend(active.decoder.decode(&frame));
+                        }
                     }
                     continue;
                 }
