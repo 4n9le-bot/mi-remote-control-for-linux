@@ -16,8 +16,8 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
     ATVV_CHARACTERISTIC_UUIDS, AttachmentMonitor, AtvvChange, AtvvEvent, AtvvGatt, AtvvTransport,
-    BluezClient, BluezSnapshot, Clock, Command, CommandOutput, Device, GattCharacteristic,
-    GattService, OperationalEvent, OperationalEvents, ProcessExecutor, Storage,
+    BluezClient, BluezSnapshot, Clock, Command, CommandOutput, ControlNotification, Device,
+    GattCharacteristic, GattService, OperationalEvent, OperationalEvents, ProcessExecutor, Storage,
 };
 
 static UNIQUE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -49,9 +49,11 @@ enum NotificationRole {
 }
 
 impl AtvvTransport for SystemBoundaries {
-    fn next_event(&mut self) -> io::Result<AtvvEvent> {
+    fn next_event(&mut self, deadline: Option<SystemTime>) -> io::Result<Option<AtvvEvent>> {
         let mut attachment = std::mem::take(&mut self.attachment);
-        let result = attachment.next_event(self).map_err(io::Error::other);
+        let result = attachment
+            .next_event(self, deadline)
+            .map_err(io::Error::other);
         self.attachment = attachment;
         result
     }
@@ -127,7 +129,12 @@ impl AtvvGatt for SystemBoundaries {
                             continue;
                         };
                         Some(match role {
-                            NotificationRole::Control => AtvvChange::ControlNotification(value),
+                            NotificationRole::Control => {
+                                AtvvChange::ControlNotification(ControlNotification {
+                                    received_at: SystemTime::now(),
+                                    payload: value,
+                                })
+                            }
                             NotificationRole::Audio => AtvvChange::AudioNotification(value),
                         })
                     } else {
@@ -195,14 +202,31 @@ impl AtvvGatt for SystemBoundaries {
         })
     }
 
-    fn wait_for_change(&mut self) -> io::Result<AtvvChange> {
-        if let Some(watch) = self.event_watch.as_ref() {
-            return watch.changes.recv().map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "ATVV connection monitor stopped")
-            });
+    fn wait_for_change_until(
+        &mut self,
+        deadline: Option<SystemTime>,
+    ) -> io::Result<Option<AtvvChange>> {
+        let timeout = deadline
+            .map(|deadline| {
+                deadline
+                    .duration_since(SystemTime::now())
+                    .unwrap_or(Duration::ZERO)
+            })
+            .unwrap_or(Duration::MAX);
+        let Some(watch) = self.event_watch.as_ref() else {
+            thread::sleep(timeout.min(Duration::from_millis(250)));
+            return Ok(deadline
+                .is_none_or(|deadline| SystemTime::now() < deadline)
+                .then_some(AtvvChange::TopologyChanged));
+        };
+        match watch.changes.recv_timeout(timeout) {
+            Ok(change) => Ok(Some(change)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "ATVV connection monitor stopped",
+            )),
         }
-        thread::sleep(Duration::from_millis(250));
-        Ok(AtvvChange::TopologyChanged)
     }
 }
 
@@ -471,6 +495,11 @@ impl OperationalEvents for SystemBoundaries {
                 unix_millis(at),
                 stream_id,
                 samples
+            ),
+            OperationalEvent::ControlNotificationIgnored { at, issue } => eprintln!(
+                "event=control_notification_ignored at_unix_ms={} issue={:?}",
+                unix_millis(at),
+                issue
             ),
             OperationalEvent::WavCleanupFailed { at, path } => eprintln!(
                 "event=wav_cleanup_failed at_unix_ms={} retained_wav={:?}",

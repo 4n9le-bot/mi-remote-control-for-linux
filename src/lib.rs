@@ -2,7 +2,7 @@ use std::{
     ffi::OsStr,
     io,
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use serde::Deserialize;
@@ -147,15 +147,24 @@ pub trait AtvvGatt {
     fn watch_connection(&mut self, device_path: &str) -> io::Result<()>;
     fn subscribe(&mut self, characteristic_path: &str) -> io::Result<()>;
     fn get_capabilities(&mut self, tx_path: &str, control_path: &str) -> io::Result<Vec<u8>>;
-    fn wait_for_change(&mut self) -> io::Result<AtvvChange>;
+    fn wait_for_change_until(
+        &mut self,
+        deadline: Option<SystemTime>,
+    ) -> io::Result<Option<AtvvChange>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtvvChange {
     TopologyChanged,
     ConnectionChanged,
-    ControlNotification(Vec<u8>),
+    ControlNotification(ControlNotification),
     AudioNotification(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlNotification {
+    pub received_at: SystemTime,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +229,11 @@ struct AttachedIdentity {
 }
 
 impl AttachmentMonitor {
-    pub fn next_event(&mut self, gatt: &mut impl AtvvGatt) -> Result<AtvvEvent, AttachmentError> {
+    pub fn next_event(
+        &mut self,
+        gatt: &mut impl AtvvGatt,
+        deadline: Option<SystemTime>,
+    ) -> Result<Option<AtvvEvent>, AttachmentError> {
         loop {
             if let Some(ready) = self.ready_remote.as_ref() {
                 let snapshot = gatt.snapshot().map_err(AttachmentError::Inspect)?;
@@ -228,24 +241,30 @@ impl AttachmentMonitor {
                     remote.address == ready.address && remote.endpoints == ready.endpoints
                 });
                 if remains_online {
-                    match gatt.wait_for_change().map_err(AttachmentError::Wait)? {
+                    let Some(change) = gatt
+                        .wait_for_change_until(deadline)
+                        .map_err(AttachmentError::Wait)?
+                    else {
+                        return Ok(None);
+                    };
+                    match change {
                         AtvvChange::ConnectionChanged => {
                             self.ready_remote = None;
                             self.waiting_reported = true;
-                            return Ok(AtvvEvent::WaitingForRemote);
+                            return Ok(Some(AtvvEvent::WaitingForRemote));
                         }
                         AtvvChange::ControlNotification(payload) => {
-                            return Ok(AtvvEvent::ControlNotification(payload));
+                            return Ok(Some(AtvvEvent::ControlNotification(payload)));
                         }
                         AtvvChange::AudioNotification(payload) => {
-                            return Ok(AtvvEvent::AudioNotification(payload));
+                            return Ok(Some(AtvvEvent::AudioNotification(payload)));
                         }
                         AtvvChange::TopologyChanged => continue,
                     }
                 }
                 self.ready_remote = None;
                 self.waiting_reported = true;
-                return Ok(AtvvEvent::WaitingForRemote);
+                return Ok(Some(AtvvEvent::WaitingForRemote));
             }
 
             match attach_online_remote(gatt)? {
@@ -255,17 +274,23 @@ impl AttachmentMonitor {
                         endpoints: attached.endpoints,
                     });
                     self.waiting_reported = false;
-                    return Ok(AtvvEvent::RemoteReady {
+                    return Ok(Some(AtvvEvent::RemoteReady {
                         address: attached.address,
                         profile: attached.profile,
-                    });
+                    }));
                 }
                 None if !self.waiting_reported => {
                     self.waiting_reported = true;
-                    return Ok(AtvvEvent::WaitingForRemote);
+                    return Ok(Some(AtvvEvent::WaitingForRemote));
                 }
                 None => {
-                    gatt.wait_for_change().map_err(AttachmentError::Wait)?;
+                    if gatt
+                        .wait_for_change_until(deadline)
+                        .map_err(AttachmentError::Wait)?
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
                 }
             }
         }
@@ -408,13 +433,13 @@ pub enum AtvvEvent {
         address: String,
         profile: AtvvProfile,
     },
-    ControlNotification(Vec<u8>),
+    ControlNotification(ControlNotification),
     AudioNotification(Vec<u8>),
     Stopped,
 }
 
 pub trait AtvvTransport {
-    fn next_event(&mut self) -> io::Result<AtvvEvent>;
+    fn next_event(&mut self, deadline: Option<SystemTime>) -> io::Result<Option<AtvvEvent>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,6 +490,10 @@ pub enum OperationalEvent {
         stream_id: u8,
         samples: usize,
     },
+    ControlNotificationIgnored {
+        at: SystemTime,
+        issue: ControlNotificationIssue,
+    },
     WavCleanupFailed {
         at: SystemTime,
         path: PathBuf,
@@ -472,6 +501,35 @@ pub enum OperationalEvent {
     DaemonStopped {
         at: SystemTime,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlNotificationIssue {
+    WavHandoffBusy,
+    DuplicateStart,
+    OutOfOrder,
+    Unknown,
+    Malformed,
+}
+
+enum ControlMessage {
+    Start { stream_id: u8 },
+    Stop,
+    Malformed,
+    Unknown,
+}
+
+impl ControlMessage {
+    fn parse(payload: &[u8]) -> Self {
+        match payload {
+            [0x04, 0x03, 0x02, stream_id] => Self::Start {
+                stream_id: *stream_id,
+            },
+            [0x00, 0x02] => Self::Stop,
+            [0x04, ..] | [0x00, ..] | [] => Self::Malformed,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 pub trait OperationalEvents {
@@ -651,6 +709,7 @@ struct Capture {
     profile: AtvvProfile,
     decoder: ImaAdpcmDecoder,
     samples: Vec<i16>,
+    started_at: SystemTime,
 }
 
 impl<B> RunningApplication<'_, B>
@@ -664,8 +723,23 @@ where
     pub fn run(mut self) -> Result<(), RunError> {
         let mut capture: Option<Capture> = None;
         let mut profile: Option<AtvvProfile> = None;
+        let mut reject_starts_received_through: Option<SystemTime> = None;
         loop {
-            let event = self.boundaries.next_event().map_err(RunError)?;
+            let deadline = capture.as_ref().map(|capture| {
+                capture.started_at + Duration::from_secs(self.config.max_duration_secs)
+            });
+            if deadline.is_some_and(|deadline| self.boundaries.now() >= deadline) {
+                reject_starts_received_through = self.process_pending_capture(
+                    &mut capture,
+                    deadline.expect("Capture has a deadline"),
+                );
+                continue;
+            }
+            let Some(event) = self.boundaries.next_event(deadline).map_err(RunError)? else {
+                reject_starts_received_through =
+                    self.process_pending_capture(&mut capture, self.boundaries.now());
+                continue;
+            };
             let at = self.boundaries.now();
             let operational_event = match event {
                 AtvvEvent::WaitingForRemote => {
@@ -679,33 +753,43 @@ where
                     profile = Some(negotiated_profile);
                     OperationalEvent::RemoteReady { at, address }
                 }
-                AtvvEvent::ControlNotification(payload) => {
-                    match payload.as_slice() {
-                        [0x04, 0x03, 0x02, stream_id] if capture.is_none() && profile.is_some() => {
+                AtvvEvent::ControlNotification(notification) => {
+                    let issue = match ControlMessage::parse(&notification.payload) {
+                        ControlMessage::Start { .. } if capture.is_some() => {
+                            Some(ControlNotificationIssue::DuplicateStart)
+                        }
+                        ControlMessage::Start { .. }
+                            if reject_starts_received_through
+                                .is_some_and(|cutoff| notification.received_at <= cutoff) =>
+                        {
+                            Some(ControlNotificationIssue::WavHandoffBusy)
+                        }
+                        ControlMessage::Start { stream_id } if profile.is_some() => {
                             capture = Some(Capture {
-                                stream_id: *stream_id,
+                                stream_id,
                                 profile: profile.expect("profile checked before Capture"),
                                 decoder: ImaAdpcmDecoder::default(),
                                 samples: Vec::new(),
+                                started_at: notification.received_at,
                             });
+                            None
                         }
-                        [0x00, 0x02] => {
+                        ControlMessage::Stop => {
                             if let Some(completed) = capture.take() {
-                                let samples = completed.samples.len();
-                                if samples > 0 {
-                                    self.complete_capture(
-                                        completed.profile.sample_rate_hz(),
-                                        &completed.samples,
-                                    );
-                                    self.boundaries.emit(OperationalEvent::CaptureCompleted {
-                                        at,
-                                        stream_id: completed.stream_id,
-                                        samples,
-                                    });
-                                }
+                                self.process_completed_capture(completed, at);
+                                reject_starts_received_through = Some(self.boundaries.now());
+                                None
+                            } else {
+                                Some(ControlNotificationIssue::OutOfOrder)
                             }
                         }
-                        _ => {}
+                        ControlMessage::Start { .. } => Some(ControlNotificationIssue::OutOfOrder),
+                        ControlMessage::Malformed => Some(ControlNotificationIssue::Malformed),
+                        ControlMessage::Unknown => Some(ControlNotificationIssue::Unknown),
+                    };
+                    if let Some(issue) = issue {
+                        self.boundaries
+                            .emit(OperationalEvent::ControlNotificationIgnored { at, issue });
                     }
                     continue;
                 }
@@ -726,7 +810,33 @@ where
         }
     }
 
-    fn complete_capture(&mut self, sample_rate_hz: u32, samples: &[i16]) {
+    fn process_pending_capture(
+        &mut self,
+        capture: &mut Option<Capture>,
+        at: SystemTime,
+    ) -> Option<SystemTime> {
+        let completed = capture.take()?;
+        self.process_completed_capture(completed, at);
+        Some(self.boundaries.now())
+    }
+
+    fn process_completed_capture(&mut self, completed: Capture, at: SystemTime) {
+        let samples = completed.samples.len();
+        if samples == 0 {
+            return;
+        }
+        self.perform_wav_handoff_and_text_commit(
+            completed.profile.sample_rate_hz(),
+            &completed.samples,
+        );
+        self.boundaries.emit(OperationalEvent::CaptureCompleted {
+            at,
+            stream_id: completed.stream_id,
+            samples,
+        });
+    }
+
+    fn perform_wav_handoff_and_text_commit(&mut self, sample_rate_hz: u32, samples: &[i16]) {
         let wav = pcm16_wav(sample_rate_hz, samples);
         let Ok(path) = self
             .boundaries

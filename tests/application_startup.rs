@@ -2,12 +2,13 @@ use std::{
     collections::VecDeque,
     io,
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use atvv_bridge::{
     Application, AtvvEvent, AtvvTransport, Clock, Command, CommandOutput, ConfigSelection,
-    OperationalEvent, OperationalEvents, ProcessExecutor, Storage,
+    ControlNotification, ControlNotificationIssue, OperationalEvent, OperationalEvents,
+    ProcessExecutor, Storage,
 };
 
 #[derive(Default)]
@@ -21,19 +22,49 @@ struct ControlledBoundaries {
     events: Vec<OperationalEvent>,
     wav: Option<(PathBuf, Vec<u8>)>,
     removed_files: Vec<PathBuf>,
+    now: Duration,
+    observed_deadlines: Vec<Option<SystemTime>>,
+    timeout_after_events: Option<usize>,
+    process_durations: VecDeque<Duration>,
+    wav_creation_duration: Duration,
 }
 
 impl AtvvTransport for ControlledBoundaries {
-    fn next_event(&mut self) -> io::Result<AtvvEvent> {
-        self.atvv_events
+    fn next_event(&mut self, deadline: Option<SystemTime>) -> io::Result<Option<AtvvEvent>> {
+        self.observed_deadlines.push(deadline);
+        if let Some(deadline) = deadline {
+            match self.timeout_after_events {
+                Some(0) => {
+                    self.timeout_after_events = None;
+                    self.now = deadline
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .expect("controlled deadlines follow the Unix epoch");
+                    return Ok(None);
+                }
+                Some(remaining) => self.timeout_after_events = Some(remaining - 1),
+                None => {}
+            }
+        }
+        let event = self
+            .atvv_events
             .pop_front()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "script exhausted"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "script exhausted"))?;
+        if let AtvvEvent::ControlNotification(notification) = &event {
+            self.now = self.now.max(
+                notification
+                    .received_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("controlled notifications follow the Unix epoch"),
+            );
+        }
+        Ok(Some(event))
     }
 }
 
 impl ProcessExecutor for ControlledBoundaries {
     fn execute(&mut self, command: &Command) -> io::Result<CommandOutput> {
         self.commands.push(command.clone());
+        self.now += self.process_durations.pop_front().unwrap_or_default();
         self.process_results
             .pop_front()
             .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotFound, "not scripted")))
@@ -54,6 +85,8 @@ impl Storage for ControlledBoundaries {
     }
 
     fn create_private_wav(&mut self, _directory: &Path, contents: &[u8]) -> io::Result<PathBuf> {
+        self.now += self.wav_creation_duration;
+        self.wav_creation_duration = Duration::ZERO;
         let path = PathBuf::from("/tmp/atvv-bridge/capture-test.wav");
         self.wav = Some((path.clone(), contents.to_vec()));
         Ok(path)
@@ -67,7 +100,7 @@ impl Storage for ControlledBoundaries {
 
 impl Clock for ControlledBoundaries {
     fn now(&self) -> SystemTime {
-        SystemTime::UNIX_EPOCH
+        SystemTime::UNIX_EPOCH + self.now
     }
 }
 
@@ -288,9 +321,9 @@ fn completed_capture_is_transcribed_committed_and_deleted() {
                 address: "AA:BB:CC:DD:EE:FF".into(),
                 profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
             },
-            AtvvEvent::ControlNotification(vec![0x04, 0x03, 0x02, 0x65]),
+            control_at(0, vec![0x04, 0x03, 0x02, 0x65]),
             AtvvEvent::AudioNotification(frame),
-            AtvvEvent::ControlNotification(vec![0x00, 0x02]),
+            control_at(0, vec![0x00, 0x02]),
             AtvvEvent::Stopped,
         ]),
         process_results: VecDeque::from([
@@ -353,4 +386,260 @@ fn completed_capture_is_transcribed_committed_and_deleted() {
             samples: 240,
         }]
     );
+}
+
+#[test]
+fn maximum_duration_hands_off_collected_audio_without_a_stop_notification() {
+    let deadline = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
+    let mut boundaries = ControlledBoundaries {
+        config: Some("max_duration_secs = 2\n".into()),
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            control_at(0, vec![0x04, 0x03, 0x02, 0x65]),
+            AtvvEvent::AudioNotification(vec![0x11; 120]),
+            AtvvEvent::Stopped,
+        ]),
+        process_results: VecDeque::from([Ok(CommandOutput {
+            status: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })]),
+        timeout_after_events: Some(1),
+        ..Default::default()
+    };
+
+    let running = Application::start(
+        ConfigSelection::Explicit("/etc/atvv-bridge.toml".into()),
+        &mut boundaries,
+    )
+    .expect("startup should succeed");
+    running
+        .run()
+        .expect("an expired Capture should complete and remain usable");
+
+    assert_eq!(boundaries.commands.len(), 1);
+    assert!(boundaries.wav.is_some());
+    assert!(boundaries.observed_deadlines.contains(&Some(deadline)));
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::CaptureCompleted {
+                at: deadline,
+                stream_id: 0x65,
+                samples: 240,
+            })
+    );
+}
+
+#[test]
+fn queued_notifications_cannot_extend_capture_beyond_the_duration_limit() {
+    let mut boundaries = ControlledBoundaries {
+        config: Some("max_duration_secs = 2\n".into()),
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            control_at(0, vec![0x04, 0x03, 0x02, 1]),
+            AtvvEvent::AudioNotification(vec![0x11; 120]),
+            control_at(2, vec![0x99]),
+            AtvvEvent::AudioNotification(vec![0x11; 120]),
+            control_at(3, vec![0x04, 0x03, 0x02, 2]),
+            AtvvEvent::Stopped,
+        ]),
+        process_results: VecDeque::from([successful_process("")]),
+        ..Default::default()
+    };
+
+    Application::start(
+        ConfigSelection::Explicit("/etc/atvv-bridge.toml".into()),
+        &mut boundaries,
+    )
+    .expect("startup should succeed")
+    .run()
+    .expect("queued notifications should not defeat the duration limit");
+
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::CaptureCompleted {
+                at: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                stream_id: 1,
+                samples: 240,
+            })
+    );
+    assert_eq!(boundaries.wav.as_ref().unwrap().1.len(), 44 + 240 * 2);
+}
+
+#[test]
+fn start_received_during_handoff_is_rejected_without_queueing_or_overlap() {
+    let frame = vec![0x11; 120];
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            control_at(0, vec![0x04, 0x03, 0x02, 1]),
+            AtvvEvent::AudioNotification(frame.clone()),
+            control_at(1, vec![0x00, 0x02]),
+            control_at_millis(1_500, vec![0x04, 0x03, 0x02, 2]),
+            control_at_millis(2_500, vec![0x04, 0x03, 0x02, 3]),
+            control_at_millis(3_500, vec![0x04, 0x03, 0x02, 4]),
+            control_at(5, vec![0x04, 0x03, 0x02, 5]),
+            AtvvEvent::AudioNotification(frame),
+            control_at(6, vec![0x00, 0x02]),
+            AtvvEvent::Stopped,
+        ]),
+        process_results: VecDeque::from([
+            successful_process("first"),
+            successful_process(""),
+            successful_process("second"),
+            successful_process(""),
+        ]),
+        process_durations: VecDeque::from([Duration::from_secs(1), Duration::from_secs(1)]),
+        wav_creation_duration: Duration::from_secs(1),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("busy starts should not disrupt the daemon");
+
+    let completed_streams = boundaries
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OperationalEvent::CaptureCompleted { stream_id, .. } => Some(*stream_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completed_streams, [1, 5]);
+    assert_eq!(
+        boundaries
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                OperationalEvent::ControlNotificationIgnored {
+                    issue: ControlNotificationIssue::WavHandoffBusy,
+                    ..
+                }
+            ))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn invalid_control_notifications_are_warned_and_do_not_corrupt_capture_state() {
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            control_at(0, vec![0x00, 0x02]),
+            control_at(1, vec![0x99, 0x01]),
+            control_at(2, vec![0x04, 0x01]),
+            control_at(3, vec![0x04, 0x03, 0x02, 7]),
+            control_at(4, vec![0x04, 0x03, 0x02, 8]),
+            AtvvEvent::AudioNotification(vec![0x11; 120]),
+            control_at(5, vec![0x00, 0x02]),
+            AtvvEvent::Stopped,
+        ]),
+        process_results: VecDeque::from([successful_process("")]),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("invalid controls should not terminate the daemon");
+
+    let issues = boundaries
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OperationalEvent::ControlNotificationIgnored { issue, .. } => Some(*issue),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        [
+            ControlNotificationIssue::OutOfOrder,
+            ControlNotificationIssue::Unknown,
+            ControlNotificationIssue::Malformed,
+            ControlNotificationIssue::DuplicateStart,
+        ]
+    );
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::CaptureCompleted {
+                at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
+                stream_id: 7,
+                samples: 240,
+            })
+    );
+}
+
+#[test]
+fn empty_expired_and_normally_stopped_captures_run_no_external_commands() {
+    let mut boundaries = ControlledBoundaries {
+        config: Some("max_duration_secs = 2\n".into()),
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            control_at(0, vec![0x04, 0x03, 0x02, 1]),
+            control_at(3, vec![0x04, 0x03, 0x02, 2]),
+            control_at(4, vec![0x00, 0x02]),
+            AtvvEvent::Stopped,
+        ]),
+        timeout_after_events: Some(0),
+        ..Default::default()
+    };
+
+    Application::start(
+        ConfigSelection::Explicit("/etc/atvv-bridge.toml".into()),
+        &mut boundaries,
+    )
+    .expect("startup should succeed")
+    .run()
+    .expect("empty Captures should leave the daemon usable");
+
+    assert!(boundaries.commands.is_empty());
+    assert!(boundaries.wav.is_none());
+    assert!(
+        !boundaries
+            .events
+            .iter()
+            .any(|event| matches!(event, OperationalEvent::CaptureCompleted { .. }))
+    );
+}
+
+fn control_at(seconds: u64, payload: Vec<u8>) -> AtvvEvent {
+    control_at_millis(seconds * 1_000, payload)
+}
+
+fn control_at_millis(milliseconds: u64, payload: Vec<u8>) -> AtvvEvent {
+    AtvvEvent::ControlNotification(ControlNotification {
+        received_at: SystemTime::UNIX_EPOCH + Duration::from_millis(milliseconds),
+        payload,
+    })
+}
+
+fn successful_process(stdout: &str) -> io::Result<CommandOutput> {
+    Ok(CommandOutput {
+        status: 0,
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    })
 }

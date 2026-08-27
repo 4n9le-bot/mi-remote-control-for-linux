@@ -2,8 +2,8 @@ use std::{collections::VecDeque, io};
 
 use atvv_bridge::{
     AttachmentError, AttachmentMonitor, AtvvChange, AtvvCodec, AtvvEvent, AtvvGatt,
-    AtvvInteractionModel, AtvvProfile, AtvvVersion, BluezSnapshot, Device, GattCharacteristic,
-    GattService, ProfileError, attach_online_remote, select_profile,
+    AtvvInteractionModel, AtvvProfile, AtvvVersion, BluezSnapshot, ControlNotification, Device,
+    GattCharacteristic, GattService, ProfileError, attach_online_remote, select_profile,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,12 +50,16 @@ impl AtvvGatt for ControlledGatt {
         Ok(self.capabilities.clone())
     }
 
-    fn wait_for_change(&mut self) -> io::Result<AtvvChange> {
+    fn wait_for_change_until(
+        &mut self,
+        _deadline: Option<std::time::SystemTime>,
+    ) -> io::Result<Option<AtvvChange>> {
         self.operations.push(GattOperation::WaitForChange);
-        Ok(self
-            .changes
-            .pop_front()
-            .unwrap_or(AtvvChange::TopologyChanged))
+        Ok(Some(
+            self.changes
+                .pop_front()
+                .unwrap_or(AtvvChange::TopologyChanged),
+        ))
     }
 }
 
@@ -157,13 +161,15 @@ fn monitor_waits_without_failing_and_attaches_when_a_remote_appears() {
 
     assert_eq!(
         monitor
-            .next_event(&mut gatt)
+            .next_event(&mut gatt, None)
+            .map(|event| event.expect("unlimited wait should produce an event"))
             .expect("waiting should be healthy"),
         AtvvEvent::WaitingForRemote
     );
     assert_eq!(
         monitor
-            .next_event(&mut gatt)
+            .next_event(&mut gatt, None)
+            .map(|event| event.expect("unlimited wait should produce an event"))
             .expect("attachment should succeed"),
         AtvvEvent::RemoteReady {
             address: "AA:BB:CC:DD:EE:FF".into(),
@@ -184,7 +190,8 @@ fn monitor_does_not_report_ready_when_capability_negotiation_fails() {
     let mut monitor = AttachmentMonitor::default();
 
     let error = monitor
-        .next_event(&mut gatt)
+        .next_event(&mut gatt, None)
+        .map(|event| event.expect("unlimited wait should produce an event"))
         .expect_err("an uncertified profile must fail closed");
 
     assert!(matches!(
@@ -213,15 +220,15 @@ fn rebuilt_gatt_endpoints_force_resubscription_and_renegotiation() {
     let mut monitor = AttachmentMonitor::default();
 
     assert!(matches!(
-        monitor.next_event(&mut gatt),
+        next_event(&mut monitor, &mut gatt),
         Ok(AtvvEvent::RemoteReady { .. })
     ));
     assert_eq!(
-        monitor.next_event(&mut gatt).unwrap(),
+        next_event(&mut monitor, &mut gatt).unwrap(),
         AtvvEvent::WaitingForRemote
     );
     assert!(matches!(
-        monitor.next_event(&mut gatt),
+        next_event(&mut monitor, &mut gatt),
         Ok(AtvvEvent::RemoteReady { .. })
     ));
     assert_eq!(
@@ -248,15 +255,15 @@ fn reconnect_with_stable_gatt_paths_still_forces_renegotiation() {
     let mut monitor = AttachmentMonitor::default();
 
     assert!(matches!(
-        monitor.next_event(&mut gatt),
+        next_event(&mut monitor, &mut gatt),
         Ok(AtvvEvent::RemoteReady { .. })
     ));
     assert_eq!(
-        monitor.next_event(&mut gatt).unwrap(),
+        next_event(&mut monitor, &mut gatt).unwrap(),
         AtvvEvent::WaitingForRemote
     );
     assert!(matches!(
-        monitor.next_event(&mut gatt),
+        next_event(&mut monitor, &mut gatt),
         Ok(AtvvEvent::RemoteReady { .. })
     ));
     assert_eq!(
@@ -274,7 +281,10 @@ fn attached_monitor_forwards_control_and_audio_notifications() {
     let mut gatt = ControlledGatt {
         snapshots: VecDeque::from([ready.clone(), ready.clone(), ready]),
         changes: VecDeque::from([
-            AtvvChange::ControlNotification(vec![0x04, 0x03, 0x02, 0x91]),
+            AtvvChange::ControlNotification(ControlNotification {
+                received_at: std::time::SystemTime::UNIX_EPOCH,
+                payload: vec![0x04, 0x03, 0x02, 0x91],
+            }),
             AtvvChange::AudioNotification(vec![0x11; 120]),
         ]),
         capabilities: vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78, 0x00, 0x00],
@@ -283,17 +293,29 @@ fn attached_monitor_forwards_control_and_audio_notifications() {
     let mut monitor = AttachmentMonitor::default();
 
     assert!(matches!(
-        monitor.next_event(&mut gatt),
+        next_event(&mut monitor, &mut gatt),
         Ok(AtvvEvent::RemoteReady { .. })
     ));
     assert_eq!(
-        monitor.next_event(&mut gatt).unwrap(),
-        AtvvEvent::ControlNotification(vec![0x04, 0x03, 0x02, 0x91])
+        next_event(&mut monitor, &mut gatt).unwrap(),
+        AtvvEvent::ControlNotification(ControlNotification {
+            received_at: std::time::SystemTime::UNIX_EPOCH,
+            payload: vec![0x04, 0x03, 0x02, 0x91],
+        })
     );
     assert_eq!(
-        monitor.next_event(&mut gatt).unwrap(),
+        next_event(&mut monitor, &mut gatt).unwrap(),
         AtvvEvent::AudioNotification(vec![0x11; 120])
     );
+}
+
+fn next_event(
+    monitor: &mut AttachmentMonitor,
+    gatt: &mut ControlledGatt,
+) -> Result<AtvvEvent, AttachmentError> {
+    monitor
+        .next_event(gatt, None)
+        .map(|event| event.expect("unlimited wait should produce an event"))
 }
 
 fn ready_snapshot() -> BluezSnapshot {
