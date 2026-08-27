@@ -12,8 +12,8 @@ use std::{
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
-    AtvvEvent, AtvvTransport, Clock, Command, CommandOutput, OperationalEvent, OperationalEvents,
-    ProcessExecutor, Storage,
+    AtvvEvent, AtvvTransport, BluezClient, BluezSnapshot, Clock, Command, CommandOutput, Device,
+    GattCharacteristic, GattService, OperationalEvent, OperationalEvents, ProcessExecutor, Storage,
 };
 
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -27,6 +27,95 @@ impl AtvvTransport for SystemBoundaries {
             thread::park();
         }
     }
+}
+
+impl BluezClient for SystemBoundaries {
+    fn managed_objects(&mut self) -> io::Result<BluezSnapshot> {
+        let connection = zbus::blocking::Connection::system().map_err(io::Error::other)?;
+        let proxy = zbus::blocking::fdo::ObjectManagerProxy::builder(&connection)
+            .destination("org.bluez")
+            .map_err(io::Error::other)?
+            .path("/")
+            .map_err(io::Error::other)?
+            .build()
+            .map_err(io::Error::other)?;
+        let objects = proxy.get_managed_objects().map_err(io::Error::other)?;
+        let mut snapshot = BluezSnapshot::default();
+
+        for (path, interfaces) in objects {
+            let path = path.to_string();
+            for (interface, properties) in interfaces {
+                match interface.as_str() {
+                    "org.bluez.Device1" => {
+                        let (Some(address), Some(connected), Some(services_resolved)) = (
+                            string_property(&properties, "Address"),
+                            bool_property(&properties, "Connected"),
+                            bool_property(&properties, "ServicesResolved"),
+                        ) else {
+                            continue;
+                        };
+                        snapshot.devices.push(Device {
+                            path: path.clone(),
+                            address,
+                            connected,
+                            services_resolved,
+                        });
+                    }
+                    "org.bluez.GattService1" => {
+                        let (Some(uuid), Some(device_path)) = (
+                            string_property(&properties, "UUID"),
+                            path_property(&properties, "Device"),
+                        ) else {
+                            continue;
+                        };
+                        snapshot.services.push(GattService {
+                            path: path.clone(),
+                            device_path,
+                            uuid,
+                        });
+                    }
+                    "org.bluez.GattCharacteristic1" => {
+                        let (Some(uuid), Some(service_path)) = (
+                            string_property(&properties, "UUID"),
+                            path_property(&properties, "Service"),
+                        ) else {
+                            continue;
+                        };
+                        snapshot
+                            .characteristics
+                            .push(GattCharacteristic { service_path, uuid });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+}
+
+fn string_property(
+    properties: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    name: &str,
+) -> Option<String> {
+    <&str>::try_from(properties.get(name)?)
+        .ok()
+        .map(str::to_owned)
+}
+
+fn bool_property(
+    properties: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    name: &str,
+) -> Option<bool> {
+    bool::try_from(properties.get(name)?).ok()
+}
+
+fn path_property(
+    properties: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    name: &str,
+) -> Option<String> {
+    <&zbus::zvariant::ObjectPath<'_>>::try_from(properties.get(name)?)
+        .ok()
+        .map(ToString::to_string)
 }
 
 impl ProcessExecutor for SystemBoundaries {

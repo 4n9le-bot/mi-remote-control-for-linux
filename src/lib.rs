@@ -10,6 +10,121 @@ use thiserror::Error;
 
 pub mod system;
 
+const ATVV_SERVICE_UUID: &str = "ab5e0001-0000-1000-8000-00805f9b34fb";
+const ATVV_CHARACTERISTIC_UUIDS: [&str; 3] = [
+    "ab5e0002-0000-1000-8000-00805f9b34fb",
+    "ab5e0003-0000-1000-8000-00805f9b34fb",
+    "ab5e0004-0000-1000-8000-00805f9b34fb",
+];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BluezSnapshot {
+    pub devices: Vec<Device>,
+    pub services: Vec<GattService>,
+    pub characteristics: Vec<GattCharacteristic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    pub path: String,
+    pub address: String,
+    pub connected: bool,
+    pub services_resolved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GattService {
+    pub path: String,
+    pub device_path: String,
+    pub uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GattCharacteristic {
+    pub service_path: String,
+    pub uuid: String,
+}
+
+pub trait BluezClient {
+    fn managed_objects(&mut self) -> io::Result<BluezSnapshot>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotReady {
+    NoAtvvRemote,
+    Disconnected,
+    ServicesUnresolved,
+    MissingCharacteristics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Readiness {
+    Ready {
+        address: String,
+    },
+    NotReady {
+        address: Option<String>,
+        reason: NotReady,
+    },
+}
+
+pub fn check_readiness(bluez: &mut impl BluezClient) -> io::Result<Readiness> {
+    Ok(bluez.managed_objects()?.readiness())
+}
+
+impl BluezSnapshot {
+    fn readiness(&self) -> Readiness {
+        let mut candidates: Vec<_> = self
+            .devices
+            .iter()
+            .filter(|device| {
+                self.services.iter().any(|service| {
+                    service.device_path == device.path
+                        && service.uuid.eq_ignore_ascii_case(ATVV_SERVICE_UUID)
+                })
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            right
+                .connected
+                .cmp(&left.connected)
+                .then_with(|| left.address.cmp(&right.address))
+        });
+        let Some(device) = candidates.first() else {
+            return Readiness::NotReady {
+                address: None,
+                reason: NotReady::NoAtvvRemote,
+            };
+        };
+        let not_ready = |reason| Readiness::NotReady {
+            address: Some(device.address.clone()),
+            reason,
+        };
+        if !device.connected {
+            return not_ready(NotReady::Disconnected);
+        }
+        if !device.services_resolved {
+            return not_ready(NotReady::ServicesUnresolved);
+        }
+        let has_complete_service = self.services.iter().any(|service| {
+            service.device_path == device.path
+                && service.uuid.eq_ignore_ascii_case(ATVV_SERVICE_UUID)
+                && ATVV_CHARACTERISTIC_UUIDS.iter().all(|expected| {
+                    self.characteristics.iter().any(|characteristic| {
+                        characteristic.service_path == service.path
+                            && characteristic.uuid.eq_ignore_ascii_case(expected)
+                    })
+                })
+        });
+        if !has_complete_service {
+            return not_ready(NotReady::MissingCharacteristics);
+        }
+        Readiness::Ready {
+            address: device.address.clone(),
+        }
+    }
+}
+
 const DEFAULT_MAX_DURATION_SECS: u64 = 60;
 const DEFAULT_WAV_DIR: &str = "/tmp/atvv-bridge";
 const MAX_DURATION_SECS: u64 = 3_600;
