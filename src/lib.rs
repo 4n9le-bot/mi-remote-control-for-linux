@@ -197,6 +197,13 @@ pub fn attach_online_remote(
     gatt: &mut impl AtvvGatt,
 ) -> Result<Option<AttachedRemote>, AttachmentError> {
     let snapshot = gatt.snapshot().map_err(AttachmentError::Inspect)?;
+    attach_remote_from_snapshot(gatt, snapshot)
+}
+
+fn attach_remote_from_snapshot(
+    gatt: &mut impl AtvvGatt,
+    snapshot: BluezSnapshot,
+) -> Result<Option<AttachedRemote>, AttachmentError> {
     let Some(remote) = snapshot.online_remote() else {
         return Ok(None);
     };
@@ -227,6 +234,15 @@ pub struct AttachmentMonitor {
 struct AttachedIdentity {
     address: String,
     endpoints: AtvvEndpoints,
+}
+
+impl From<OnlineRemote> for AttachedIdentity {
+    fn from(remote: OnlineRemote) -> Self {
+        Self {
+            address: remote.address,
+            endpoints: remote.endpoints,
+        }
+    }
 }
 
 impl AttachmentMonitor {
@@ -269,12 +285,16 @@ impl AttachmentMonitor {
                 return Ok(Some(AtvvEvent::WaitingForRemote));
             }
 
-            match attach_online_remote(gatt) {
+            let snapshot = gatt.snapshot().map_err(AttachmentError::Inspect)?;
+            let attempted_identity = snapshot.online_remote().map(AttachedIdentity::from);
+            match attach_remote_from_snapshot(gatt, snapshot) {
                 Err(error) => {
-                    let remote_went_offline = gatt
-                        .snapshot()
-                        .is_ok_and(|snapshot| snapshot.online_remote().is_none());
-                    if !remote_went_offline {
+                    let Ok(current_snapshot) = gatt.snapshot() else {
+                        return Err(error);
+                    };
+                    let current_identity =
+                        current_snapshot.online_remote().map(AttachedIdentity::from);
+                    if current_identity == attempted_identity {
                         return Err(error);
                     }
                     self.waiting_reported = true;

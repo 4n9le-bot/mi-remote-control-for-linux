@@ -251,9 +251,13 @@ fn monitor_forwards_shutdown_while_waiting_for_a_remote() {
 
 #[test]
 fn gatt_removal_during_attachment_returns_to_waiting_and_retries() {
-    let ready = ready_snapshot();
+    let first = ready_snapshot();
+    let mut rebuilt = ready_snapshot();
+    for characteristic in &mut rebuilt.characteristics {
+        characteristic.path = characteristic.path.replace("char000", "char001");
+    }
     let mut gatt = VanishingGatt {
-        snapshots: VecDeque::from([ready.clone(), BluezSnapshot::default(), ready]),
+        snapshots: VecDeque::from([first, rebuilt.clone(), rebuilt]),
         subscribe_attempts: 0,
         operations: Vec::new(),
     };
