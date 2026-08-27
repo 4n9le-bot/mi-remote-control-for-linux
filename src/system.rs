@@ -15,30 +15,37 @@ use futures_lite::{StreamExt, future};
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
-    AttachmentMonitor, AtvvChange, AtvvEvent, AtvvGatt, AtvvTransport, BluezClient, BluezSnapshot,
-    Clock, Command, CommandOutput, Device, GattCharacteristic, GattService, OperationalEvent,
-    OperationalEvents, ProcessExecutor, Storage,
+    ATVV_CHARACTERISTIC_UUIDS, AttachmentMonitor, AtvvChange, AtvvEvent, AtvvGatt, AtvvTransport,
+    BluezClient, BluezSnapshot, Clock, Command, CommandOutput, Device, GattCharacteristic,
+    GattService, OperationalEvent, OperationalEvents, ProcessExecutor, Storage,
 };
 
-static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static UNIQUE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default)]
 pub struct SystemBoundaries {
     attachment: AttachmentMonitor,
     bluez: Option<zbus::blocking::Connection>,
-    connection_watch: Option<ConnectionWatch>,
+    event_watch: Option<EventWatch>,
+    notification_roles: HashMap<String, NotificationRole>,
 }
 
 #[derive(Debug)]
-struct ConnectionWatch {
-    changes: mpsc::Receiver<()>,
+struct EventWatch {
+    changes: mpsc::Receiver<AtvvChange>,
     cancel: async_channel::Sender<()>,
 }
 
-impl Drop for ConnectionWatch {
+impl Drop for EventWatch {
     fn drop(&mut self) {
         let _ = self.cancel.try_send(());
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NotificationRole {
+    Control,
+    Audio,
 }
 
 impl AtvvTransport for SystemBoundaries {
@@ -56,50 +63,78 @@ impl AtvvGatt for SystemBoundaries {
     }
 
     fn watch_connection(&mut self, device_path: &str) -> io::Result<()> {
-        self.connection_watch = None;
+        self.event_watch = None;
         let connection = self.bluez_connection()?.inner().clone();
         let device_path = device_path.to_owned();
+        let notification_roles = self.notification_roles.clone();
         let (changes_tx, changes_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let (cancel_tx, cancel_rx) = async_channel::bounded(1);
         thread::spawn(move || {
             async_io::block_on(async move {
-                let proxy = match async_device_proxy(&connection, &device_path).await {
-                    Ok(proxy) => proxy,
+                let rule = match zbus::MatchRule::builder()
+                    .msg_type(zbus::message::Type::Signal)
+                    .sender("org.bluez")
+                    .and_then(|builder| builder.interface("org.freedesktop.DBus.Properties"))
+                    .and_then(|builder| builder.member("PropertiesChanged"))
+                    .map(|builder| builder.build())
+                {
+                    Ok(rule) => rule,
                     Err(error) => {
-                        let _ = ready_tx.send(Err(error));
+                        let _ = ready_tx.send(Err(io::Error::other(error)));
                         return;
                     }
                 };
-                let mut connected = proxy.receive_property_changed::<bool>("Connected").await;
-                let mut services_resolved = proxy
-                    .receive_property_changed::<bool>("ServicesResolved")
-                    .await;
+                let mut properties =
+                    match zbus::MessageStream::for_match_rule(rule, &connection, Some(256)).await {
+                        Ok(properties) => properties,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(io::Error::other(error)));
+                            return;
+                        }
+                    };
                 if ready_tx.send(Ok(())).is_err() {
                     return;
                 }
                 loop {
-                    let connection_changed = future::race(
-                        async {
-                            Some(
-                                future::race(connected.next(), services_resolved.next())
-                                    .await
-                                    .is_some(),
-                            )
-                        },
-                        async {
-                            let _ = cancel_rx.recv().await;
-                            None
-                        },
-                    )
+                    let next = future::race(async { properties.next().await }, async {
+                        let _ = cancel_rx.recv().await;
+                        None
+                    })
                     .await;
-                    match connection_changed {
-                        None => return,
-                        Some(stream_open) => {
-                            if changes_tx.send(()).is_err() || !stream_open {
-                                return;
-                            }
-                        }
+                    let Some(Ok(message)) = next else {
+                        return;
+                    };
+                    let Some(path) = message.header().path().map(ToString::to_string) else {
+                        continue;
+                    };
+                    let Ok((_, changed, _)) = message.body().deserialize::<(
+                        String,
+                        HashMap<String, zbus::zvariant::OwnedValue>,
+                        Vec<String>,
+                    )>() else {
+                        continue;
+                    };
+                    let event = if path == device_path
+                        && (changed.contains_key("Connected")
+                            || changed.contains_key("ServicesResolved"))
+                    {
+                        Some(AtvvChange::ConnectionChanged)
+                    } else if let (Some(role), Some(value)) =
+                        (notification_roles.get(&path), changed.get("Value"))
+                    {
+                        let Ok(value) = value.try_clone().and_then(Vec::<u8>::try_from) else {
+                            continue;
+                        };
+                        Some(match role {
+                            NotificationRole::Control => AtvvChange::ControlNotification(value),
+                            NotificationRole::Audio => AtvvChange::AudioNotification(value),
+                        })
+                    } else {
+                        None
+                    };
+                    if event.is_some_and(|event| changes_tx.send(event).is_err()) {
+                        return;
                     }
                 }
             });
@@ -107,7 +142,7 @@ impl AtvvGatt for SystemBoundaries {
         ready_rx
             .recv()
             .map_err(|_| io::Error::other("ATVV connection monitor stopped during setup"))??;
-        self.connection_watch = Some(ConnectionWatch {
+        self.event_watch = Some(EventWatch {
             changes: changes_rx,
             cancel: cancel_tx,
         });
@@ -161,11 +196,10 @@ impl AtvvGatt for SystemBoundaries {
     }
 
     fn wait_for_change(&mut self) -> io::Result<AtvvChange> {
-        if let Some(watch) = self.connection_watch.as_ref() {
-            watch.changes.recv().map_err(|_| {
+        if let Some(watch) = self.event_watch.as_ref() {
+            return watch.changes.recv().map_err(|_| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "ATVV connection monitor stopped")
-            })?;
-            return Ok(AtvvChange::ConnectionChanged);
+            });
         }
         thread::sleep(Duration::from_millis(250));
         Ok(AtvvChange::TopologyChanged)
@@ -206,15 +240,6 @@ async fn async_characteristic_proxy<'a>(
     )
     .await
     .map_err(io::Error::other)
-}
-
-async fn async_device_proxy<'a>(
-    connection: &zbus::Connection,
-    path: &'a str,
-) -> io::Result<zbus::Proxy<'a>> {
-    zbus::Proxy::new(connection, "org.bluez", path, "org.bluez.Device1")
-        .await
-        .map_err(io::Error::other)
 }
 
 impl BluezClient for SystemBoundaries {
@@ -279,6 +304,26 @@ impl BluezClient for SystemBoundaries {
                 }
             }
         }
+        self.notification_roles = snapshot
+            .characteristics
+            .iter()
+            .filter_map(|characteristic| {
+                let role = if characteristic
+                    .uuid
+                    .eq_ignore_ascii_case(ATVV_CHARACTERISTIC_UUIDS[1])
+                {
+                    NotificationRole::Audio
+                } else if characteristic
+                    .uuid
+                    .eq_ignore_ascii_case(ATVV_CHARACTERISTIC_UUIDS[2])
+                {
+                    NotificationRole::Control
+                } else {
+                    return None;
+                };
+                Some((characteristic.path.clone(), role))
+            })
+            .collect();
         Ok(snapshot)
     }
 }
@@ -342,7 +387,7 @@ impl Storage for SystemBoundaries {
         let probe = path.join(format!(
             ".atvv-bridge-write-probe-{}-{}",
             process::id(),
-            PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            UNIQUE_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -351,6 +396,40 @@ impl Storage for SystemBoundaries {
         let file = options.open(&probe)?;
         drop(file);
         fs::remove_file(probe)
+    }
+
+    fn create_private_wav(
+        &mut self,
+        directory: &Path,
+        contents: &[u8],
+    ) -> io::Result<std::path::PathBuf> {
+        use std::io::Write;
+
+        for _ in 0..16 {
+            let sequence = UNIQUE_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!("capture-{}-{sequence}.wav", process::id()));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&path) {
+                Ok(mut file) => {
+                    file.write_all(contents)?;
+                    file.sync_all()?;
+                    return Ok(path);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a private WAV path",
+        ))
+    }
+
+    fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
     }
 }
 
@@ -382,6 +461,21 @@ impl OperationalEvents for SystemBoundaries {
                 "event=remote_ready at_unix_ms={} address={:?}",
                 unix_millis(at),
                 address
+            ),
+            OperationalEvent::CaptureCompleted {
+                at,
+                stream_id,
+                samples,
+            } => eprintln!(
+                "event=capture_completed at_unix_ms={} stream_id={} samples={}",
+                unix_millis(at),
+                stream_id,
+                samples
+            ),
+            OperationalEvent::WavCleanupFailed { at, path } => eprintln!(
+                "event=wav_cleanup_failed at_unix_ms={} retained_wav={:?}",
+                unix_millis(at),
+                path
             ),
             OperationalEvent::DaemonStopped { at } => {
                 eprintln!("event=daemon_stopped at_unix_ms={}", unix_millis(at))

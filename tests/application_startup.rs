@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, io, path::Path, time::SystemTime};
+use std::{
+    collections::VecDeque,
+    io,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use atvv_bridge::{
     Application, AtvvEvent, AtvvTransport, Clock, Command, CommandOutput, ConfigSelection,
@@ -14,6 +19,8 @@ struct ControlledBoundaries {
     process_results: VecDeque<io::Result<CommandOutput>>,
     commands: Vec<Command>,
     events: Vec<OperationalEvent>,
+    wav: Option<(PathBuf, Vec<u8>)>,
+    removed_files: Vec<PathBuf>,
 }
 
 impl AtvvTransport for ControlledBoundaries {
@@ -43,6 +50,17 @@ impl Storage for ControlledBoundaries {
             return Err(io::Error::new(kind, "controlled storage failure"));
         }
         self.prepared_wav_dir = Some(path.display().to_string());
+        Ok(())
+    }
+
+    fn create_private_wav(&mut self, _directory: &Path, contents: &[u8]) -> io::Result<PathBuf> {
+        let path = PathBuf::from("/tmp/atvv-bridge/capture-test.wav");
+        self.wav = Some((path.clone(), contents.to_vec()));
+        Ok(path)
+    }
+
+    fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+        self.removed_files.push(path.to_owned());
         Ok(())
     }
 }
@@ -231,6 +249,7 @@ fn scripted_atvv_transport_drives_observable_daemon_behavior() {
             AtvvEvent::WaitingForRemote,
             AtvvEvent::RemoteReady {
                 address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
             },
             AtvvEvent::Stopped,
         ]),
@@ -256,5 +275,82 @@ fn scripted_atvv_transport_drives_observable_daemon_behavior() {
                 at: SystemTime::UNIX_EPOCH,
             },
         ]
+    );
+}
+
+#[test]
+fn completed_capture_is_transcribed_committed_and_deleted() {
+    let frame = vec![0x11; 120];
+    let transcript = "quotes ' \"; $(still-data)\nsecond line";
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            },
+            AtvvEvent::ControlNotification(vec![0x04, 0x03, 0x02, 0x65]),
+            AtvvEvent::AudioNotification(frame),
+            AtvvEvent::ControlNotification(vec![0x00, 0x02]),
+            AtvvEvent::Stopped,
+        ]),
+        process_results: VecDeque::from([
+            Ok(CommandOutput {
+                status: 0,
+                stdout: format!("\n  {transcript}\t\n").into_bytes(),
+                stderr: Vec::new(),
+            }),
+            Ok(CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }),
+        ]),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("a valid Capture should complete");
+
+    let (path, wav) = boundaries.wav.as_ref().expect("a WAV should be created");
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+    assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
+    assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+    assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 480);
+    assert_eq!(wav.len(), 44 + 240 * 2);
+    assert_eq!(i16::from_le_bytes([wav[44], wav[45]]), 1);
+    assert_eq!(i16::from_le_bytes([wav[46], wav[47]]), 2);
+    assert_eq!(i16::from_le_bytes([wav[522], wav[523]]), 240);
+    assert_eq!(
+        boundaries.commands,
+        [
+            Command {
+                program: "voxtype".into(),
+                args: vec!["transcribe".into(), path.display().to_string()],
+            },
+            Command {
+                program: "fcitx5-commit".into(),
+                args: vec!["--text".into(), transcript.into()],
+            },
+        ]
+    );
+    assert_eq!(
+        boundaries.removed_files.as_slice(),
+        std::slice::from_ref(path)
+    );
+    assert_eq!(
+        boundaries
+            .events
+            .iter()
+            .filter(|event| matches!(event, OperationalEvent::CaptureCompleted { .. }))
+            .collect::<Vec<_>>(),
+        [&OperationalEvent::CaptureCompleted {
+            at: SystemTime::UNIX_EPOCH,
+            stream_id: 0x65,
+            samples: 240,
+        }]
     );
 }

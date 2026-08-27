@@ -10,8 +10,8 @@ use thiserror::Error;
 
 pub mod system;
 
-const ATVV_SERVICE_UUID: &str = "ab5e0001-5a21-4f05-bc7d-af01f617b664";
-const ATVV_CHARACTERISTIC_UUIDS: [&str; 3] = [
+pub(crate) const ATVV_SERVICE_UUID: &str = "ab5e0001-5a21-4f05-bc7d-af01f617b664";
+pub(crate) const ATVV_CHARACTERISTIC_UUIDS: [&str; 3] = [
     "ab5e0002-5a21-4f05-bc7d-af01f617b664",
     "ab5e0003-5a21-4f05-bc7d-af01f617b664",
     "ab5e0004-5a21-4f05-bc7d-af01f617b664",
@@ -150,10 +150,12 @@ pub trait AtvvGatt {
     fn wait_for_change(&mut self) -> io::Result<AtvvChange>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtvvChange {
     TopologyChanged,
     ConnectionChanged,
+    ControlNotification(Vec<u8>),
+    AudioNotification(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,14 +228,20 @@ impl AttachmentMonitor {
                     remote.address == ready.address && remote.endpoints == ready.endpoints
                 });
                 if remains_online {
-                    if gatt.wait_for_change().map_err(AttachmentError::Wait)?
-                        == AtvvChange::ConnectionChanged
-                    {
-                        self.ready_remote = None;
-                        self.waiting_reported = true;
-                        return Ok(AtvvEvent::WaitingForRemote);
+                    match gatt.wait_for_change().map_err(AttachmentError::Wait)? {
+                        AtvvChange::ConnectionChanged => {
+                            self.ready_remote = None;
+                            self.waiting_reported = true;
+                            return Ok(AtvvEvent::WaitingForRemote);
+                        }
+                        AtvvChange::ControlNotification(payload) => {
+                            return Ok(AtvvEvent::ControlNotification(payload));
+                        }
+                        AtvvChange::AudioNotification(payload) => {
+                            return Ok(AtvvEvent::AudioNotification(payload));
+                        }
+                        AtvvChange::TopologyChanged => continue,
                     }
-                    continue;
                 }
                 self.ready_remote = None;
                 self.waiting_reported = true;
@@ -249,6 +257,7 @@ impl AttachmentMonitor {
                     self.waiting_reported = false;
                     return Ok(AtvvEvent::RemoteReady {
                         address: attached.address,
+                        profile: attached.profile,
                     });
                 }
                 None if !self.waiting_reported => {
@@ -395,7 +404,12 @@ const MAX_DURATION_SECS: u64 = 3_600;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtvvEvent {
     WaitingForRemote,
-    RemoteReady { address: String },
+    RemoteReady {
+        address: String,
+        profile: AtvvProfile,
+    },
+    ControlNotification(Vec<u8>),
+    AudioNotification(Vec<u8>),
     Stopped,
 }
 
@@ -423,6 +437,8 @@ pub trait ProcessExecutor {
 pub trait Storage {
     fn read_optional_config(&mut self, path: &Path) -> io::Result<Option<String>>;
     fn prepare_wav_dir(&mut self, path: &Path) -> io::Result<()>;
+    fn create_private_wav(&mut self, directory: &Path, contents: &[u8]) -> io::Result<PathBuf>;
+    fn remove_file(&mut self, path: &Path) -> io::Result<()>;
 }
 
 pub trait Clock {
@@ -443,6 +459,15 @@ pub enum OperationalEvent {
     RemoteReady {
         at: SystemTime,
         address: String,
+    },
+    CaptureCompleted {
+        at: SystemTime,
+        stream_id: u8,
+        samples: usize,
+    },
+    WavCleanupFailed {
+        at: SystemTime,
+        path: PathBuf,
     },
     DaemonStopped {
         at: SystemTime,
@@ -572,6 +597,62 @@ pub struct RunningApplication<'a, B> {
     boundaries: &'a mut B,
 }
 
+#[derive(Debug, Default)]
+pub struct ImaAdpcmDecoder {
+    predictor: i32,
+    step_index: i32,
+}
+
+impl ImaAdpcmDecoder {
+    pub fn decode(&mut self, encoded: &[u8]) -> Vec<i16> {
+        let mut samples = Vec::with_capacity(encoded.len() * 2);
+        for byte in encoded {
+            samples.push(self.decode_nibble(byte >> 4));
+            samples.push(self.decode_nibble(byte & 0x0f));
+        }
+        samples
+    }
+
+    fn decode_nibble(&mut self, nibble: u8) -> i16 {
+        const STEP_TABLE: [i32; 89] = [
+            7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55,
+            60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+            337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411,
+            1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+            5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500,
+            20350, 22385, 24623, 27086, 29794, 32767,
+        ];
+        const INDEX_TABLE: [i32; 16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+
+        let step = STEP_TABLE[self.step_index as usize];
+        let mut difference = step >> 3;
+        if nibble & 1 != 0 {
+            difference += step >> 2;
+        }
+        if nibble & 2 != 0 {
+            difference += step >> 1;
+        }
+        if nibble & 4 != 0 {
+            difference += step;
+        }
+        if nibble & 8 != 0 {
+            self.predictor -= difference;
+        } else {
+            self.predictor += difference;
+        }
+        self.predictor = self.predictor.clamp(i16::MIN as i32, i16::MAX as i32);
+        self.step_index = (self.step_index + INDEX_TABLE[nibble as usize]).clamp(0, 88);
+        self.predictor as i16
+    }
+}
+
+struct Capture {
+    stream_id: u8,
+    profile: AtvvProfile,
+    decoder: ImaAdpcmDecoder,
+    samples: Vec<i16>,
+}
+
 impl<B> RunningApplication<'_, B>
 where
     B: AtvvTransport + ProcessExecutor + Storage + Clock + OperationalEvents,
@@ -580,13 +661,62 @@ where
         &self.config
     }
 
-    pub fn run(self) -> Result<(), RunError> {
+    pub fn run(mut self) -> Result<(), RunError> {
+        let mut capture: Option<Capture> = None;
+        let mut profile: Option<AtvvProfile> = None;
         loop {
             let event = self.boundaries.next_event().map_err(RunError)?;
             let at = self.boundaries.now();
             let operational_event = match event {
-                AtvvEvent::WaitingForRemote => OperationalEvent::WaitingForRemote { at },
-                AtvvEvent::RemoteReady { address } => OperationalEvent::RemoteReady { at, address },
+                AtvvEvent::WaitingForRemote => {
+                    profile = None;
+                    OperationalEvent::WaitingForRemote { at }
+                }
+                AtvvEvent::RemoteReady {
+                    address,
+                    profile: negotiated_profile,
+                } => {
+                    profile = Some(negotiated_profile);
+                    OperationalEvent::RemoteReady { at, address }
+                }
+                AtvvEvent::ControlNotification(payload) => {
+                    match payload.as_slice() {
+                        [0x04, 0x03, 0x02, stream_id] if capture.is_none() && profile.is_some() => {
+                            capture = Some(Capture {
+                                stream_id: *stream_id,
+                                profile: profile.expect("profile checked before Capture"),
+                                decoder: ImaAdpcmDecoder::default(),
+                                samples: Vec::new(),
+                            });
+                        }
+                        [0x00, 0x02] => {
+                            if let Some(completed) = capture.take() {
+                                let samples = completed.samples.len();
+                                if samples > 0 {
+                                    self.complete_capture(
+                                        completed.profile.sample_rate_hz(),
+                                        &completed.samples,
+                                    );
+                                    self.boundaries.emit(OperationalEvent::CaptureCompleted {
+                                        at,
+                                        stream_id: completed.stream_id,
+                                        samples,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                AtvvEvent::AudioNotification(frame) => {
+                    if let Some(active) = capture.as_mut()
+                        && frame.len() == active.profile.frame_bytes()
+                    {
+                        active.samples.extend(active.decoder.decode(&frame));
+                    }
+                    continue;
+                }
                 AtvvEvent::Stopped => {
                     self.boundaries.emit(OperationalEvent::DaemonStopped { at });
                     return Ok(());
@@ -595,6 +725,68 @@ where
             self.boundaries.emit(operational_event);
         }
     }
+
+    fn complete_capture(&mut self, sample_rate_hz: u32, samples: &[i16]) {
+        let wav = pcm16_wav(sample_rate_hz, samples);
+        let Ok(path) = self
+            .boundaries
+            .create_private_wav(&self.config.wav_dir, &wav)
+        else {
+            return;
+        };
+        let transcription = Command {
+            program: "voxtype".into(),
+            args: vec!["transcribe".into(), path.display().to_string()],
+        };
+        let Ok(output) = self.boundaries.execute(&transcription) else {
+            return;
+        };
+        if output.status != 0 {
+            return;
+        }
+        let Ok(stdout) = String::from_utf8(output.stdout) else {
+            return;
+        };
+        let transcript = stdout.trim();
+        if !transcript.is_empty() {
+            let commit = Command {
+                program: "fcitx5-commit".into(),
+                args: vec!["--text".into(), transcript.into()],
+            };
+            let Ok(output) = self.boundaries.execute(&commit) else {
+                return;
+            };
+            if output.status != 0 {
+                return;
+            }
+        }
+        if !self.config.keep_wav && self.boundaries.remove_file(&path).is_err() {
+            let at = self.boundaries.now();
+            self.boundaries
+                .emit(OperationalEvent::WavCleanupFailed { at, path });
+        }
+    }
+}
+
+fn pcm16_wav(sample_rate_hz: u32, samples: &[i16]) -> Vec<u8> {
+    let data_len = u32::try_from(samples.len().saturating_mul(2)).unwrap_or(u32::MAX);
+    let mut wav = Vec::with_capacity(44 + samples.len() * 2);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36_u32.saturating_add(data_len)).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate_hz.to_le_bytes());
+    wav.extend_from_slice(&sample_rate_hz.saturating_mul(2).to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
 }
 
 fn load_config<B>(selection: ConfigSelection, storage: &mut B) -> Result<Config, StartupError>

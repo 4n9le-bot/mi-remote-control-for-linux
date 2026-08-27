@@ -167,6 +167,7 @@ fn monitor_waits_without_failing_and_attaches_when_a_remote_appears() {
             .expect("attachment should succeed"),
         AtvvEvent::RemoteReady {
             address: "AA:BB:CC:DD:EE:FF".into(),
+            profile: AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
         }
     );
     assert!(gatt.operations.contains(&GattOperation::WaitForChange));
@@ -264,6 +265,34 @@ fn reconnect_with_stable_gatt_paths_still_forces_renegotiation() {
             .filter(|operation| matches!(operation, GattOperation::GetCapabilities { .. }))
             .count(),
         2
+    );
+}
+
+#[test]
+fn attached_monitor_forwards_control_and_audio_notifications() {
+    let ready = ready_snapshot();
+    let mut gatt = ControlledGatt {
+        snapshots: VecDeque::from([ready.clone(), ready.clone(), ready]),
+        changes: VecDeque::from([
+            AtvvChange::ControlNotification(vec![0x04, 0x03, 0x02, 0x91]),
+            AtvvChange::AudioNotification(vec![0x11; 120]),
+        ]),
+        capabilities: vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78, 0x00, 0x00],
+        operations: Vec::new(),
+    };
+    let mut monitor = AttachmentMonitor::default();
+
+    assert!(matches!(
+        monitor.next_event(&mut gatt),
+        Ok(AtvvEvent::RemoteReady { .. })
+    ));
+    assert_eq!(
+        monitor.next_event(&mut gatt).unwrap(),
+        AtvvEvent::ControlNotification(vec![0x04, 0x03, 0x02, 0x91])
+    );
+    assert_eq!(
+        monitor.next_event(&mut gatt).unwrap(),
+        AtvvEvent::AudioNotification(vec![0x11; 120])
     );
 }
 
