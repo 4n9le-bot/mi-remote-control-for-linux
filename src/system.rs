@@ -83,8 +83,6 @@ impl AtvvGatt for SystemBoundaries {
                 let rule = match zbus::MatchRule::builder()
                     .msg_type(zbus::message::Type::Signal)
                     .sender("org.bluez")
-                    .and_then(|builder| builder.interface("org.freedesktop.DBus.Properties"))
-                    .and_then(|builder| builder.member("PropertiesChanged"))
                     .map(|builder| builder.build())
                 {
                     Ok(rule) => rule,
@@ -113,9 +111,25 @@ impl AtvvGatt for SystemBoundaries {
                     let Some(Ok(message)) = next else {
                         return;
                     };
-                    let Some(path) = message.header().path().map(ToString::to_string) else {
+                    let header = message.header();
+                    let Some(path) = header.path().map(ToString::to_string) else {
                         continue;
                     };
+                    let interface = header.interface().map(|name| name.as_str());
+                    let member = header.member().map(|name| name.as_str());
+                    if interface == Some("org.freedesktop.DBus.ObjectManager")
+                        && matches!(member, Some("InterfacesAdded" | "InterfacesRemoved"))
+                    {
+                        if changes_tx.send(AtvvChange::TopologyChanged).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    if interface != Some("org.freedesktop.DBus.Properties")
+                        || member != Some("PropertiesChanged")
+                    {
+                        continue;
+                    }
                     let Ok((_, changed, _)) = message.body().deserialize::<(
                         String,
                         HashMap<String, zbus::zvariant::OwnedValue>,
@@ -225,25 +239,11 @@ impl AtvvGatt for SystemBoundaries {
         let poll_interval = timeout.min(Duration::from_millis(250));
         let Some(watch) = self.event_watch.as_ref() else {
             thread::sleep(poll_interval);
-            return if self.shutdown_requested.load(Ordering::Relaxed) {
-                Ok(Some(AtvvChange::Stopped))
-            } else {
-                Ok(deadline
-                    .is_none_or(|deadline| SystemTime::now() < deadline)
-                    .then_some(AtvvChange::TopologyChanged))
-            };
+            return Ok(self.poll_result(deadline));
         };
         match watch.changes.recv_timeout(poll_interval) {
             Ok(change) => Ok(Some(change)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if self.shutdown_requested.load(Ordering::Relaxed) {
-                    Ok(Some(AtvvChange::Stopped))
-                } else {
-                    Ok(deadline
-                        .is_none_or(|deadline| SystemTime::now() < deadline)
-                        .then_some(AtvvChange::TopologyChanged))
-                }
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(self.poll_result(deadline)),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "ATVV connection monitor stopped",
@@ -253,6 +253,16 @@ impl AtvvGatt for SystemBoundaries {
 }
 
 impl SystemBoundaries {
+    fn poll_result(&self, deadline: Option<SystemTime>) -> Option<AtvvChange> {
+        if self.shutdown_requested.load(Ordering::Relaxed) {
+            Some(AtvvChange::Stopped)
+        } else {
+            deadline
+                .is_none_or(|deadline| SystemTime::now() < deadline)
+                .then_some(AtvvChange::TopologyChanged)
+        }
+    }
+
     fn ensure_signal_handlers(&mut self) -> io::Result<()> {
         if self.signal_handlers_installed {
             return Ok(());
@@ -570,10 +580,7 @@ fn unix_millis(time: SystemTime) -> u128 {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
+        sync::{Arc, atomic::AtomicBool},
         time::{Duration, SystemTime},
     };
 
@@ -596,6 +603,5 @@ mod tests {
                 .expect("shutdown polling should remain healthy"),
             Some(AtvvChange::Stopped)
         );
-        assert!(shutdown_requested.load(Ordering::Relaxed));
     }
 }

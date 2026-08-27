@@ -63,6 +63,56 @@ impl AtvvGatt for ControlledGatt {
     }
 }
 
+struct VanishingGatt {
+    snapshots: VecDeque<BluezSnapshot>,
+    subscribe_attempts: usize,
+    operations: Vec<GattOperation>,
+}
+
+impl AtvvGatt for VanishingGatt {
+    fn snapshot(&mut self) -> io::Result<BluezSnapshot> {
+        self.operations.push(GattOperation::Snapshot);
+        self.snapshots.pop_front().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "snapshot script exhausted")
+        })
+    }
+
+    fn watch_connection(&mut self, device_path: &str) -> io::Result<()> {
+        self.operations
+            .push(GattOperation::WatchConnection(device_path.into()));
+        Ok(())
+    }
+
+    fn subscribe(&mut self, characteristic_path: &str) -> io::Result<()> {
+        self.operations
+            .push(GattOperation::Subscribe(characteristic_path.into()));
+        self.subscribe_attempts += 1;
+        if self.subscribe_attempts == 1 {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "controlled GATT removal",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn get_capabilities(&mut self, tx_path: &str, control_path: &str) -> io::Result<Vec<u8>> {
+        self.operations.push(GattOperation::GetCapabilities {
+            tx: tx_path.into(),
+            control: control_path.into(),
+        });
+        Ok(vec![0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78, 0x00, 0x00])
+    }
+
+    fn wait_for_change_until(
+        &mut self,
+        _deadline: Option<std::time::SystemTime>,
+    ) -> io::Result<Option<AtvvChange>> {
+        Ok(Some(AtvvChange::TopologyChanged))
+    }
+}
+
 #[test]
 fn observed_capabilities_select_the_certified_atvv_profile() {
     let profile = select_profile(&[0x0B, 0x01, 0x00, 0x02, 0x03, 0x00, 0x78, 0x00, 0x00])
@@ -196,6 +246,33 @@ fn monitor_forwards_shutdown_while_waiting_for_a_remote() {
     assert_eq!(
         next_event(&mut monitor, &mut gatt).unwrap(),
         AtvvEvent::Stopped
+    );
+}
+
+#[test]
+fn gatt_removal_during_attachment_returns_to_waiting_and_retries() {
+    let ready = ready_snapshot();
+    let mut gatt = VanishingGatt {
+        snapshots: VecDeque::from([ready.clone(), BluezSnapshot::default(), ready]),
+        subscribe_attempts: 0,
+        operations: Vec::new(),
+    };
+    let mut monitor = AttachmentMonitor::default();
+
+    assert_eq!(
+        monitor.next_event(&mut gatt, None).unwrap().unwrap(),
+        AtvvEvent::WaitingForRemote
+    );
+    assert!(matches!(
+        monitor.next_event(&mut gatt, None).unwrap().unwrap(),
+        AtvvEvent::RemoteReady { .. }
+    ));
+    assert_eq!(
+        gatt.operations
+            .iter()
+            .filter(|operation| matches!(operation, GattOperation::GetCapabilities { .. }))
+            .count(),
+        1
     );
 }
 

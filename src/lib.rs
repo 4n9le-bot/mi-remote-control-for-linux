@@ -269,8 +269,18 @@ impl AttachmentMonitor {
                 return Ok(Some(AtvvEvent::WaitingForRemote));
             }
 
-            match attach_online_remote(gatt)? {
-                Some(attached) => {
+            match attach_online_remote(gatt) {
+                Err(error) => {
+                    let remote_went_offline = gatt
+                        .snapshot()
+                        .is_ok_and(|snapshot| snapshot.online_remote().is_none());
+                    if !remote_went_offline {
+                        return Err(error);
+                    }
+                    self.waiting_reported = true;
+                    return Ok(Some(AtvvEvent::WaitingForRemote));
+                }
+                Ok(Some(attached)) => {
                     self.ready_remote = Some(AttachedIdentity {
                         address: attached.address.clone(),
                         endpoints: attached.endpoints,
@@ -281,11 +291,11 @@ impl AttachmentMonitor {
                         profile: attached.profile,
                     }));
                 }
-                None if !self.waiting_reported => {
+                Ok(None) if !self.waiting_reported => {
                     self.waiting_reported = true;
                     return Ok(Some(AtvvEvent::WaitingForRemote));
                 }
-                None => {
+                Ok(None) => {
                     let Some(change) = gatt
                         .wait_for_change_until(deadline)
                         .map_err(AttachmentError::Wait)?
