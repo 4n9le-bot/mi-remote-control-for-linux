@@ -124,7 +124,7 @@ fn any_complete_atvv_service_makes_the_selected_device_ready() {
         GattService {
             path: "/org/bluez/hci0/dev_one/service0009".into(),
             device_path: "/org/bluez/hci0/dev_one".into(),
-            uuid: "ab5e0001-0000-1000-8000-00805f9b34fb".into(),
+            uuid: "ab5e0001-5a21-4f05-bc7d-af01f617b664".into(),
         },
     );
     let mut bluez = ControlledBluez { snapshot };
@@ -156,12 +156,13 @@ fn ready_atvv_remote(address: &str, connected: bool, path_suffix: &str) -> Bluez
         services: vec![GattService {
             path: service_path.clone(),
             device_path,
-            uuid: "ab5e0001-0000-1000-8000-00805f9b34fb".into(),
+            uuid: "ab5e0001-5a21-4f05-bc7d-af01f617b664".into(),
         }],
         characteristics: (2..=4)
             .map(|suffix| GattCharacteristic {
+                path: format!("{service_path}/char000{suffix}"),
                 service_path: service_path.clone(),
-                uuid: format!("ab5e000{suffix}-0000-1000-8000-00805f9b34fb"),
+                uuid: format!("ab5e000{suffix}-5a21-4f05-bc7d-af01f617b664"),
             })
             .collect(),
     }

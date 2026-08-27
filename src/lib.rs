@@ -10,12 +10,108 @@ use thiserror::Error;
 
 pub mod system;
 
-const ATVV_SERVICE_UUID: &str = "ab5e0001-0000-1000-8000-00805f9b34fb";
+const ATVV_SERVICE_UUID: &str = "ab5e0001-5a21-4f05-bc7d-af01f617b664";
 const ATVV_CHARACTERISTIC_UUIDS: [&str; 3] = [
-    "ab5e0002-0000-1000-8000-00805f9b34fb",
-    "ab5e0003-0000-1000-8000-00805f9b34fb",
-    "ab5e0004-0000-1000-8000-00805f9b34fb",
+    "ab5e0002-5a21-4f05-bc7d-af01f617b664",
+    "ab5e0003-5a21-4f05-bc7d-af01f617b664",
+    "ab5e0004-5a21-4f05-bc7d-af01f617b664",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtvvVersion {
+    V1_0,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtvvInteractionModel {
+    HoldToTalk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtvvCodec {
+    ImaDviAdpcm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtvvProfile {
+    version: AtvvVersion,
+    interaction_model: AtvvInteractionModel,
+    codec: AtvvCodec,
+    sample_rate_hz: u32,
+    frame_bytes: usize,
+    headerless_frames: bool,
+}
+
+impl AtvvProfile {
+    pub const XIAOMI_V1_HTT_16KHZ_120: Self = Self {
+        version: AtvvVersion::V1_0,
+        interaction_model: AtvvInteractionModel::HoldToTalk,
+        codec: AtvvCodec::ImaDviAdpcm,
+        sample_rate_hz: 16_000,
+        frame_bytes: 120,
+        headerless_frames: true,
+    };
+
+    pub fn version(self) -> AtvvVersion {
+        self.version
+    }
+
+    pub fn interaction_model(self) -> AtvvInteractionModel {
+        self.interaction_model
+    }
+
+    pub fn codec(self) -> AtvvCodec {
+        self.codec
+    }
+
+    pub fn sample_rate_hz(self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    pub fn frame_bytes(self) -> usize {
+        self.frame_bytes
+    }
+
+    pub fn frames_are_headerless(self) -> bool {
+        self.headerless_frames
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileError {
+    #[error("malformed ATVV capability response")]
+    MalformedCapabilities,
+    #[error("unsupported ATVV protocol version")]
+    UnsupportedVersion,
+    #[error("unsupported ATVV codec")]
+    UnsupportedCodec,
+    #[error("unsupported ATVV interaction model")]
+    UnsupportedInteractionModel,
+    #[error("unsupported ATVV audio frame shape")]
+    UnsupportedFrameShape,
+}
+
+pub fn select_profile(capabilities: &[u8]) -> Result<AtvvProfile, ProfileError> {
+    if capabilities.len() != 9 || capabilities.first() != Some(&0x0B) {
+        return Err(ProfileError::MalformedCapabilities);
+    }
+    if capabilities[1..3] != [0x01, 0x00] {
+        return Err(ProfileError::UnsupportedVersion);
+    }
+    if capabilities[3] != 0x02 {
+        return Err(ProfileError::UnsupportedCodec);
+    }
+    if capabilities[4] != 0x03 {
+        return Err(ProfileError::UnsupportedInteractionModel);
+    }
+    if capabilities[5..7] != [0x00, 0x78] {
+        return Err(ProfileError::UnsupportedFrameShape);
+    }
+    if capabilities[7..9] != [0x00, 0x00] {
+        return Err(ProfileError::MalformedCapabilities);
+    }
+    Ok(AtvvProfile::XIAOMI_V1_HTT_16KHZ_120)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BluezSnapshot {
@@ -41,8 +137,143 @@ pub struct GattService {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GattCharacteristic {
+    pub path: String,
     pub service_path: String,
     pub uuid: String,
+}
+
+pub trait AtvvGatt {
+    fn snapshot(&mut self) -> io::Result<BluezSnapshot>;
+    fn watch_connection(&mut self, device_path: &str) -> io::Result<()>;
+    fn subscribe(&mut self, characteristic_path: &str) -> io::Result<()>;
+    fn get_capabilities(&mut self, tx_path: &str, control_path: &str) -> io::Result<Vec<u8>>;
+    fn wait_for_change(&mut self) -> io::Result<AtvvChange>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtvvChange {
+    TopologyChanged,
+    ConnectionChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedRemote {
+    pub address: String,
+    pub profile: AtvvProfile,
+    endpoints: AtvvEndpoints,
+}
+
+#[derive(Debug, Error)]
+pub enum AttachmentError {
+    #[error("could not inspect BlueZ objects: {0}")]
+    Inspect(#[source] io::Error),
+    #[error("could not subscribe to ATVV control notifications: {0}")]
+    SubscribeControl(#[source] io::Error),
+    #[error("could not monitor ATVV Remote connection state: {0}")]
+    WatchConnection(#[source] io::Error),
+    #[error("could not subscribe to ATVV audio notifications: {0}")]
+    SubscribeAudio(#[source] io::Error),
+    #[error("ATVV capability exchange failed: {0}")]
+    CapabilityExchange(#[source] io::Error),
+    #[error("ATVV capability negotiation failed: {0}")]
+    Profile(#[from] ProfileError),
+    #[error("could not wait for an online ATVV Remote: {0}")]
+    Wait(#[source] io::Error),
+}
+
+pub fn attach_online_remote(
+    gatt: &mut impl AtvvGatt,
+) -> Result<Option<AttachedRemote>, AttachmentError> {
+    let snapshot = gatt.snapshot().map_err(AttachmentError::Inspect)?;
+    let Some(remote) = snapshot.online_remote() else {
+        return Ok(None);
+    };
+    gatt.watch_connection(&remote.device_path)
+        .map_err(AttachmentError::WatchConnection)?;
+    gatt.subscribe(&remote.endpoints.control_path)
+        .map_err(AttachmentError::SubscribeControl)?;
+    gatt.subscribe(&remote.endpoints.audio_path)
+        .map_err(AttachmentError::SubscribeAudio)?;
+    let capabilities = gatt
+        .get_capabilities(&remote.endpoints.tx_path, &remote.endpoints.control_path)
+        .map_err(AttachmentError::CapabilityExchange)?;
+    let profile = select_profile(&capabilities)?;
+    Ok(Some(AttachedRemote {
+        address: remote.address,
+        profile,
+        endpoints: remote.endpoints,
+    }))
+}
+
+#[derive(Debug, Default)]
+pub struct AttachmentMonitor {
+    ready_remote: Option<AttachedIdentity>,
+    waiting_reported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachedIdentity {
+    address: String,
+    endpoints: AtvvEndpoints,
+}
+
+impl AttachmentMonitor {
+    pub fn next_event(&mut self, gatt: &mut impl AtvvGatt) -> Result<AtvvEvent, AttachmentError> {
+        loop {
+            if let Some(ready) = self.ready_remote.as_ref() {
+                let snapshot = gatt.snapshot().map_err(AttachmentError::Inspect)?;
+                let remains_online = snapshot.online_remote().is_some_and(|remote| {
+                    remote.address == ready.address && remote.endpoints == ready.endpoints
+                });
+                if remains_online {
+                    if gatt.wait_for_change().map_err(AttachmentError::Wait)?
+                        == AtvvChange::ConnectionChanged
+                    {
+                        self.ready_remote = None;
+                        self.waiting_reported = true;
+                        return Ok(AtvvEvent::WaitingForRemote);
+                    }
+                    continue;
+                }
+                self.ready_remote = None;
+                self.waiting_reported = true;
+                return Ok(AtvvEvent::WaitingForRemote);
+            }
+
+            match attach_online_remote(gatt)? {
+                Some(attached) => {
+                    self.ready_remote = Some(AttachedIdentity {
+                        address: attached.address.clone(),
+                        endpoints: attached.endpoints,
+                    });
+                    self.waiting_reported = false;
+                    return Ok(AtvvEvent::RemoteReady {
+                        address: attached.address,
+                    });
+                }
+                None if !self.waiting_reported => {
+                    self.waiting_reported = true;
+                    return Ok(AtvvEvent::WaitingForRemote);
+                }
+                None => {
+                    gatt.wait_for_change().map_err(AttachmentError::Wait)?;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtvvEndpoints {
+    tx_path: String,
+    audio_path: String,
+    control_path: String,
+}
+
+struct OnlineRemote {
+    address: String,
+    device_path: String,
+    endpoints: AtvvEndpoints,
 }
 
 pub trait BluezClient {
@@ -73,6 +304,48 @@ pub fn check_readiness(bluez: &mut impl BluezClient) -> io::Result<Readiness> {
 }
 
 impl BluezSnapshot {
+    fn atvv_endpoints(&self, device: &Device) -> Option<AtvvEndpoints> {
+        self.services
+            .iter()
+            .filter(|service| {
+                service.device_path == device.path
+                    && service.uuid.eq_ignore_ascii_case(ATVV_SERVICE_UUID)
+            })
+            .find_map(|service| {
+                let path_for = |uuid: &str| {
+                    self.characteristics
+                        .iter()
+                        .find(|characteristic| {
+                            characteristic.service_path == service.path
+                                && characteristic.uuid.eq_ignore_ascii_case(uuid)
+                        })
+                        .map(|characteristic| characteristic.path.clone())
+                };
+                Some(AtvvEndpoints {
+                    tx_path: path_for(ATVV_CHARACTERISTIC_UUIDS[0])?,
+                    audio_path: path_for(ATVV_CHARACTERISTIC_UUIDS[1])?,
+                    control_path: path_for(ATVV_CHARACTERISTIC_UUIDS[2])?,
+                })
+            })
+    }
+
+    fn online_remote(&self) -> Option<OnlineRemote> {
+        let mut devices: Vec<_> = self
+            .devices
+            .iter()
+            .filter(|device| device.connected && device.services_resolved)
+            .collect();
+        devices.sort_by(|left, right| left.address.cmp(&right.address));
+
+        devices.into_iter().find_map(|device| {
+            Some(OnlineRemote {
+                address: device.address.clone(),
+                device_path: device.path.clone(),
+                endpoints: self.atvv_endpoints(device)?,
+            })
+        })
+    }
+
     fn readiness(&self) -> Readiness {
         let mut candidates: Vec<_> = self
             .devices
@@ -106,17 +379,7 @@ impl BluezSnapshot {
         if !device.services_resolved {
             return not_ready(NotReady::ServicesUnresolved);
         }
-        let has_complete_service = self.services.iter().any(|service| {
-            service.device_path == device.path
-                && service.uuid.eq_ignore_ascii_case(ATVV_SERVICE_UUID)
-                && ATVV_CHARACTERISTIC_UUIDS.iter().all(|expected| {
-                    self.characteristics.iter().any(|characteristic| {
-                        characteristic.service_path == service.path
-                            && characteristic.uuid.eq_ignore_ascii_case(expected)
-                    })
-                })
-        });
-        if !has_complete_service {
+        if self.atvv_endpoints(device).is_none() {
             return not_ready(NotReady::MissingCharacteristics);
         }
         Readiness::Ready {

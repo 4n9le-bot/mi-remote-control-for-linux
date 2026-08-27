@@ -16,7 +16,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut boundaries = SystemBoundaries;
+    let mut boundaries = SystemBoundaries::default();
     if cli.check {
         return match check_readiness(&mut boundaries) {
             Ok(Readiness::Ready { address }) => {
