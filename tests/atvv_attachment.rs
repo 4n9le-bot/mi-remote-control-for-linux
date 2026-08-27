@@ -3,7 +3,8 @@ use std::{collections::VecDeque, io};
 use atvv_bridge::{
     AttachmentError, AttachmentMonitor, AtvvChange, AtvvCodec, AtvvEvent, AtvvGatt,
     AtvvInteractionModel, AtvvProfile, AtvvVersion, BluezSnapshot, ControlNotification, Device,
-    GattCharacteristic, GattService, ProfileError, attach_online_remote, select_profile,
+    GattCharacteristic, GattService, ProfileError, attach_online_remote, get_caps_request,
+    select_profile,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -111,6 +112,11 @@ impl AtvvGatt for VanishingGatt {
     ) -> io::Result<Option<AtvvChange>> {
         Ok(Some(AtvvChange::TopologyChanged))
     }
+}
+
+#[test]
+fn get_caps_request_advertises_the_supported_atvv_profile() {
+    assert_eq!(get_caps_request(), [0x0A, 0x01, 0x00, 0x00, 0x03, 0x03]);
 }
 
 #[test]

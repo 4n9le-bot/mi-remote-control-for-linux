@@ -21,6 +21,7 @@ use crate::{
     ATVV_CHARACTERISTIC_UUIDS, AttachmentMonitor, AtvvChange, AtvvEvent, AtvvGatt, AtvvTransport,
     BluezClient, BluezSnapshot, Clock, Command, CommandOutput, ControlNotification, Device,
     GattCharacteristic, GattService, OperationalEvent, OperationalEvents, ProcessExecutor, Storage,
+    get_caps_request,
 };
 
 static UNIQUE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -193,7 +194,7 @@ impl AtvvGatt for SystemBoundaries {
             let control = async_characteristic_proxy(&connection, &control_path).await?;
             let mut value_changes = control.receive_property_changed::<Vec<u8>>("Value").await;
             let options: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-            tx.call::<_, _, ()>("WriteValue", &(vec![0x0A_u8], options))
+            tx.call::<_, _, ()>("WriteValue", &(get_caps_request().to_vec(), options))
                 .await
                 .map_err(io::Error::other)?;
 

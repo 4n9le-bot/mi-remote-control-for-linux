@@ -17,6 +17,10 @@ pub(crate) const ATVV_CHARACTERISTIC_UUIDS: [&str; 3] = [
     "ab5e0004-5a21-4f05-bc7d-af01f617b664",
 ];
 
+pub const fn get_caps_request() -> [u8; 6] {
+    [0x0A, 0x01, 0x00, 0x00, 0x03, 0x03]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtvvVersion {
     V1_0,
