@@ -1,0 +1,13 @@
+[Unit]
+Description=ATVV Remote to Voxtype voice bridge
+Documentation=file:///usr/share/doc/atvv-bridge/README.md
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/atvv-bridge
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
