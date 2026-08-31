@@ -143,6 +143,10 @@ fn malformed_capabilities_fail_closed_without_echoing_the_payload() {
 
     assert_eq!(error, ProfileError::MalformedCapabilities);
     assert_eq!(error.to_string(), "malformed ATVV capability response");
+
+    let error = select_profile(&[0x0B, 0x01, 0x00, 0x01, 0x03, 0x00, 0x78, 0x00, 0x01])
+        .expect_err("invalid reserved fields must not prove an unsupported profile");
+    assert_eq!(error, ProfileError::MalformedCapabilities);
 }
 
 #[test]
@@ -301,10 +305,11 @@ fn gatt_removal_during_attachment_returns_to_waiting_and_retries() {
 }
 
 #[test]
-fn monitor_does_not_report_ready_when_capability_negotiation_fails() {
+fn monitor_reports_a_proven_unsupported_profile_as_terminal() {
+    let ready = ready_snapshot();
     let mut gatt = ControlledGatt {
-        snapshots: VecDeque::from([ready_snapshot()]),
-        changes: VecDeque::new(),
+        snapshots: VecDeque::from([ready.clone(), ready]),
+        changes: VecDeque::from([AtvvChange::Stopped]),
         capabilities: vec![0x0B, 0x02, 0x00, 0x02, 0x03, 0x00, 0x78, 0x00, 0x00],
         operations: Vec::new(),
     };
@@ -314,19 +319,47 @@ fn monitor_does_not_report_ready_when_capability_negotiation_fails() {
         monitor.next_event(&mut gatt, None).unwrap().unwrap(),
         AtvvEvent::RemoteConnected { .. }
     ));
-    let error = monitor
-        .next_event(&mut gatt, None)
-        .map(|event| event.expect("attachment should be attempted"))
-        .expect_err("an uncertified profile must fail closed");
+    assert_eq!(
+        monitor.next_event(&mut gatt, None).unwrap().unwrap(),
+        AtvvEvent::UnsupportedProfile {
+            address: "AA:BB:CC:DD:EE:FF".into(),
+            reason: ProfileError::UnsupportedVersion,
+        }
+    );
+    assert_eq!(
+        monitor.next_event(&mut gatt, None).unwrap().unwrap(),
+        AtvvEvent::Stopped
+    );
+    assert_eq!(
+        gatt.operations
+            .iter()
+            .filter(|operation| matches!(operation, GattOperation::GetCapabilities { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn malformed_capability_response_remains_retryable() {
+    let ready = ready_snapshot();
+    let mut gatt = ControlledGatt {
+        snapshots: VecDeque::from([ready.clone(), ready]),
+        changes: VecDeque::new(),
+        capabilities: vec![0x0B, 0x01],
+        operations: Vec::new(),
+    };
+    let mut monitor = AttachmentMonitor::default();
 
     assert!(matches!(
-        error,
-        AttachmentError::Profile(ProfileError::UnsupportedVersion)
+        monitor.next_event(&mut gatt, None).unwrap().unwrap(),
+        AtvvEvent::RemoteConnected { .. }
     ));
-    assert_eq!(
-        error.to_string(),
-        "ATVV capability negotiation failed: unsupported ATVV protocol version"
-    );
+    assert!(matches!(
+        monitor.next_event(&mut gatt, None),
+        Err(AttachmentError::Profile(
+            ProfileError::MalformedCapabilities
+        ))
+    ));
 }
 
 #[test]

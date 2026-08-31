@@ -5,9 +5,9 @@ use std::{
 };
 
 use atvv_bridge::{
-    AtvvProfile, AtvvProfileReadiness, CaptureStatus, DesktopApplication, DesktopShell,
-    DesktopStatus, IntegrationStage, OperationalEvent, RecentWavHandoff, RemoteStatus, VoiceBridge,
-    WavHandoffActivity,
+    AtvvProfile, AtvvProfileReadiness, BatteryStatus, CaptureStatus, DesktopApplication,
+    DesktopShell, DesktopStatus, IntegrationStage, OperationalEvent, RecentWavHandoff,
+    RecoveryStatus, RemoteStatus, VoiceBridge, WavHandoffActivity,
 };
 
 #[derive(Default)]
@@ -136,6 +136,8 @@ fn failed_wav_handoff_is_history_and_does_not_make_the_remote_unready() {
                 stage: IntegrationStage::Transcription,
                 error: "voxtype failed".into(),
             },
+            recovery: RecoveryStatus::Idle,
+            battery: BatteryStatus::Unknown,
         }
     );
 }
@@ -160,4 +162,103 @@ fn capture_returns_to_idle_when_no_wav_handoff_is_needed() {
 
     assert_eq!(status.capture, CaptureStatus::Idle);
     assert_eq!(status.recent_wav_handoff, RecentWavHandoff::NoOutcome);
+}
+
+#[test]
+fn retry_status_shows_the_next_attempt_and_failure_summary() {
+    let at = SystemTime::UNIX_EPOCH;
+    let next_attempt_at = at + Duration::from_secs(4);
+    let retrying =
+        DesktopStatus::default().transitioned_by(&OperationalEvent::AtvvRemoteRetryScheduled {
+            at,
+            next_attempt_at,
+            failure: "ATVV capability response timed out".into(),
+        });
+
+    assert_eq!(
+        retrying.recovery,
+        RecoveryStatus::Retrying {
+            next_attempt_at,
+            failure: "ATVV capability response timed out".into(),
+        }
+    );
+
+    let connected = retrying.transitioned_by(&OperationalEvent::RemoteConnected {
+        at: next_attempt_at,
+        address: "AA:BB:CC:DD:EE:FF".into(),
+    });
+    assert_eq!(connected.recovery, RecoveryStatus::Idle);
+}
+
+#[test]
+fn proven_unsupported_profile_is_displayed_without_recovery() {
+    let status =
+        DesktopStatus::default().transitioned_by(&OperationalEvent::AtvvProfileUnsupported {
+            at: SystemTime::UNIX_EPOCH,
+            address: "AA:BB:CC:DD:EE:FF".into(),
+            reason: atvv_bridge::ProfileError::UnsupportedFrameShape,
+        });
+
+    assert!(matches!(status.remote, RemoteStatus::Connected { .. }));
+    assert_eq!(
+        status.profile,
+        AtvvProfileReadiness::Unsupported {
+            reason: atvv_bridge::ProfileError::UnsupportedFrameShape,
+        }
+    );
+    assert_eq!(status.recovery, RecoveryStatus::Idle);
+}
+
+#[test]
+fn battery_becomes_unknown_immediately_after_disconnection() {
+    let connected = DesktopStatus::default()
+        .transitioned_by(&OperationalEvent::RemoteConnected {
+            at: SystemTime::UNIX_EPOCH,
+            address: "AA:BB:CC:DD:EE:FF".into(),
+        })
+        .transitioned_by(&OperationalEvent::BatteryUpdated {
+            at: SystemTime::UNIX_EPOCH,
+            percentage: atvv_bridge::BatteryPercentage::new(87),
+        });
+    assert_eq!(
+        connected.battery,
+        BatteryStatus::Percentage(atvv_bridge::BatteryPercentage::new(87).unwrap())
+    );
+
+    let disconnected = connected.transitioned_by(&OperationalEvent::WaitingForRemote {
+        at: SystemTime::UNIX_EPOCH,
+    });
+    assert_eq!(disconnected.battery, BatteryStatus::Unknown);
+}
+
+#[test]
+fn profile_recovery_preserves_connected_atvv_remote_and_current_battery() {
+    let at = SystemTime::UNIX_EPOCH;
+    let connected = DesktopStatus::default()
+        .transitioned_by(&OperationalEvent::RemoteConnected {
+            at,
+            address: "AA:BB:CC:DD:EE:FF".into(),
+        })
+        .transitioned_by(&OperationalEvent::BatteryUpdated {
+            at,
+            percentage: atvv_bridge::BatteryPercentage::new(87),
+        });
+    let retrying = connected.transitioned_by(&OperationalEvent::AtvvRemoteRetryScheduled {
+        at,
+        next_attempt_at: at + Duration::from_secs(2),
+        failure: "ATVV capability response timed out".into(),
+    });
+
+    assert!(matches!(retrying.remote, RemoteStatus::Connected { .. }));
+    assert_eq!(
+        retrying.battery,
+        BatteryStatus::Percentage(atvv_bridge::BatteryPercentage::new(87).unwrap())
+    );
+    assert!(matches!(retrying.recovery, RecoveryStatus::Retrying { .. }));
+}
+
+#[test]
+fn battery_percentage_rejects_values_above_one_hundred() {
+    assert_eq!(atvv_bridge::BatteryPercentage::new(100).unwrap().get(), 100);
+    assert_eq!(atvv_bridge::BatteryPercentage::new(101), None);
 }

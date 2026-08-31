@@ -1,8 +1,8 @@
 use std::{io, sync::mpsc, thread};
 
 use crate::{
-    Application, ConfigSelection, IntegrationStage, OperationalEvent, StartupError,
-    WavHandoffOutcome, system::SystemBoundaries,
+    Application, BatteryPercentage, ConfigSelection, IntegrationStage, OperationalEvent,
+    StartupError, WavHandoffOutcome, system::SystemBoundaries,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +15,7 @@ pub enum RemoteStatus {
 pub enum AtvvProfileReadiness {
     Waiting,
     Ready { profile: crate::AtvvProfile },
+    Unsupported { reason: crate::ProfileError },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,21 @@ pub enum CaptureStatus {
 pub enum WavHandoffActivity {
     Idle,
     Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryStatus {
+    Idle,
+    Retrying {
+        next_attempt_at: std::time::SystemTime,
+        failure: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatteryStatus {
+    Unknown,
+    Percentage(BatteryPercentage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +64,8 @@ pub struct DesktopStatus {
     pub capture: CaptureStatus,
     pub wav_handoff: WavHandoffActivity,
     pub recent_wav_handoff: RecentWavHandoff,
+    pub recovery: RecoveryStatus,
+    pub battery: BatteryStatus,
 }
 
 impl Default for DesktopStatus {
@@ -58,6 +76,8 @@ impl Default for DesktopStatus {
             capture: CaptureStatus::Idle,
             wav_handoff: WavHandoffActivity::Idle,
             recent_wav_handoff: RecentWavHandoff::NoOutcome,
+            recovery: RecoveryStatus::Idle,
+            battery: BatteryStatus::Unknown,
         }
     }
 }
@@ -71,6 +91,8 @@ impl DesktopStatus {
                 self.profile = AtvvProfileReadiness::Waiting;
                 self.capture = CaptureStatus::Idle;
                 self.wav_handoff = WavHandoffActivity::Idle;
+                self.recovery = RecoveryStatus::Idle;
+                self.battery = BatteryStatus::Unknown;
             }
             OperationalEvent::RemoteConnected { address, .. } => {
                 self.remote = RemoteStatus::Connected {
@@ -79,6 +101,8 @@ impl DesktopStatus {
                 self.profile = AtvvProfileReadiness::Waiting;
                 self.capture = CaptureStatus::Idle;
                 self.wav_handoff = WavHandoffActivity::Idle;
+                self.recovery = RecoveryStatus::Idle;
+                self.battery = BatteryStatus::Unknown;
             }
             OperationalEvent::RemoteReady {
                 address, profile, ..
@@ -89,6 +113,18 @@ impl DesktopStatus {
                 self.profile = AtvvProfileReadiness::Ready { profile: *profile };
                 self.capture = CaptureStatus::Idle;
                 self.wav_handoff = WavHandoffActivity::Idle;
+                self.recovery = RecoveryStatus::Idle;
+            }
+            OperationalEvent::AtvvProfileUnsupported {
+                address, reason, ..
+            } => {
+                self.remote = RemoteStatus::Connected {
+                    address: address.clone(),
+                };
+                self.profile = AtvvProfileReadiness::Unsupported { reason: *reason };
+                self.capture = CaptureStatus::Idle;
+                self.wav_handoff = WavHandoffActivity::Idle;
+                self.recovery = RecoveryStatus::Idle;
             }
             OperationalEvent::CaptureStarted { .. } => {
                 self.capture = CaptureStatus::Active;
@@ -112,6 +148,24 @@ impl DesktopStatus {
                 self.capture = CaptureStatus::Idle;
                 self.wav_handoff = WavHandoffActivity::Idle;
                 self.recent_wav_handoff = RecentWavHandoff::Succeeded { outcome: *outcome };
+            }
+            OperationalEvent::AtvvRemoteRetryScheduled {
+                next_attempt_at,
+                failure,
+                ..
+            } => {
+                self.profile = AtvvProfileReadiness::Waiting;
+                self.capture = CaptureStatus::Idle;
+                self.wav_handoff = WavHandoffActivity::Idle;
+                self.recovery = RecoveryStatus::Retrying {
+                    next_attempt_at: *next_attempt_at,
+                    failure: failure.clone(),
+                };
+            }
+            OperationalEvent::BatteryUpdated { percentage, .. } => {
+                self.battery = percentage
+                    .map(BatteryStatus::Percentage)
+                    .unwrap_or(BatteryStatus::Unknown);
             }
             OperationalEvent::CaptureCompleted { .. }
             | OperationalEvent::ControlNotificationIgnored { .. }

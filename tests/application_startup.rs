@@ -30,11 +30,22 @@ struct ControlledBoundaries {
     timeout_after_events: Option<usize>,
     process_durations: VecDeque<Duration>,
     wav_creation_duration: Duration,
+    transport_failures: VecDeque<io::Error>,
+    recovery_waits: Vec<SystemTime>,
+    battery_results: VecDeque<io::Result<Option<atvv_bridge::BatteryPercentage>>>,
+    battery_reads: Vec<String>,
+    scripted_transport: VecDeque<io::Result<AtvvEvent>>,
 }
 
 impl AtvvTransport for ControlledBoundaries {
     fn next_event(&mut self, deadline: Option<SystemTime>) -> io::Result<Option<AtvvEvent>> {
         self.observed_deadlines.push(deadline);
+        if let Some(step) = self.scripted_transport.pop_front() {
+            return step.map(Some);
+        }
+        if let Some(error) = self.transport_failures.pop_front() {
+            return Err(error);
+        }
         if let Some(deadline) = deadline {
             match self.timeout_after_events {
                 Some(0) => {
@@ -61,6 +72,14 @@ impl AtvvTransport for ControlledBoundaries {
             );
         }
         Ok(Some(event))
+    }
+
+    fn read_battery_percentage(
+        &mut self,
+        address: &str,
+    ) -> io::Result<Option<atvv_bridge::BatteryPercentage>> {
+        self.battery_reads.push(address.into());
+        self.battery_results.pop_front().unwrap_or(Ok(None))
     }
 }
 
@@ -114,6 +133,14 @@ impl Storage for ControlledBoundaries {
 impl Clock for ControlledBoundaries {
     fn now(&self) -> SystemTime {
         SystemTime::UNIX_EPOCH + self.now
+    }
+
+    fn wait_until(&mut self, deadline: SystemTime) -> io::Result<()> {
+        self.recovery_waits.push(deadline);
+        self.now = deadline
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("controlled waits follow the Unix epoch");
+        Ok(())
     }
 }
 
@@ -323,6 +350,211 @@ fn scripted_atvv_transport_drives_observable_daemon_behavior() {
             },
         ]
     );
+}
+
+#[test]
+fn retryable_transport_failures_follow_the_recovery_schedule() {
+    let mut boundaries = ControlledBoundaries {
+        transport_failures: (0..8)
+            .map(|attempt| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("controlled transport failure {attempt}"),
+                )
+            })
+            .collect(),
+        atvv_events: VecDeque::from([AtvvEvent::Stopped]),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("retryable failures should recover automatically");
+
+    let scheduled: Vec<_> = boundaries
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OperationalEvent::AtvvRemoteRetryScheduled {
+                at,
+                next_attempt_at,
+                failure,
+            } => Some((*at, *next_attempt_at, failure.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(scheduled.len(), 8);
+    let base_delays = [1, 2, 4, 8, 15, 30, 60, 60].map(Duration::from_secs);
+    let actual_delays: Vec<_> = scheduled
+        .iter()
+        .map(|(at, next, _)| next.duration_since(*at).unwrap())
+        .collect();
+    for (actual, base) in actual_delays.iter().zip(base_delays) {
+        assert!(*actual >= base);
+        assert!(*actual <= base + base / 10);
+    }
+    assert!(
+        actual_delays
+            .iter()
+            .zip(base_delays)
+            .any(|(actual, base)| *actual > base),
+        "the production schedule must apply jitter"
+    );
+    assert_eq!(
+        scheduled
+            .iter()
+            .map(|(_, _, failure)| *failure)
+            .collect::<Vec<_>>(),
+        (0..8)
+            .map(|attempt| format!("controlled transport failure {attempt}"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(boundaries.recovery_waits.len(), 8);
+}
+
+#[test]
+fn repeated_attachment_failures_back_off_until_the_profile_is_ready() {
+    let failure = || {
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "controlled connection failure",
+        ))
+    };
+    let mut boundaries = ControlledBoundaries {
+        scripted_transport: VecDeque::from([
+            failure(),
+            Ok(AtvvEvent::RemoteConnected {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+            }),
+            failure(),
+            Ok(AtvvEvent::RemoteReady {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
+            }),
+            failure(),
+            Ok(AtvvEvent::Stopped),
+        ]),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("a later failure should remain retryable");
+
+    let delays: Vec<_> = boundaries
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OperationalEvent::AtvvRemoteRetryScheduled {
+                at,
+                next_attempt_at,
+                ..
+            } => Some(next_attempt_at.duration_since(*at).unwrap()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delays.len(), 3);
+    assert!(delays[0] >= Duration::from_secs(1));
+    assert!(delays[0] <= Duration::from_millis(1_100));
+    assert!(delays[1] >= Duration::from_secs(1));
+    assert!(delays[1] <= Duration::from_millis(1_100));
+    assert!(delays[2] >= Duration::from_secs(1));
+    assert!(delays[2] <= Duration::from_millis(1_100));
+}
+
+#[test]
+fn proven_unsupported_profile_stops_recovery() {
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteConnected {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+            },
+            AtvvEvent::UnsupportedProfile {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                reason: atvv_bridge::ProfileError::UnsupportedCodec,
+            },
+            AtvvEvent::Stopped,
+        ]),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("unsupported profile status should remain observable");
+
+    assert!(boundaries.recovery_waits.is_empty());
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::AtvvProfileUnsupported {
+                at: SystemTime::UNIX_EPOCH,
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                reason: atvv_bridge::ProfileError::UnsupportedCodec,
+            })
+    );
+}
+
+#[test]
+fn battery_is_read_after_connection_and_hourly_while_connected() {
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([
+            AtvvEvent::RemoteConnected {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+            },
+            AtvvEvent::Stopped,
+        ]),
+        battery_results: VecDeque::from([
+            Ok(atvv_bridge::BatteryPercentage::new(87)),
+            Ok(atvv_bridge::BatteryPercentage::new(74)),
+        ]),
+        timeout_after_events: Some(0),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("battery refresh should not interrupt the bridge");
+
+    assert_eq!(
+        boundaries.battery_reads,
+        ["AA:BB:CC:DD:EE:FF", "AA:BB:CC:DD:EE:FF"]
+    );
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::BatteryUpdated {
+                at: SystemTime::UNIX_EPOCH,
+                percentage: atvv_bridge::BatteryPercentage::new(87),
+            })
+    );
+    assert!(
+        boundaries
+            .events
+            .contains(&OperationalEvent::BatteryUpdated {
+                at: SystemTime::UNIX_EPOCH + Duration::from_secs(60 * 60),
+                percentage: atvv_bridge::BatteryPercentage::new(74),
+            })
+    );
+}
+
+#[test]
+fn waiting_for_an_atvv_remote_never_reads_battery() {
+    let mut boundaries = ControlledBoundaries {
+        atvv_events: VecDeque::from([AtvvEvent::WaitingForRemote, AtvvEvent::Stopped]),
+        battery_results: VecDeque::from([Ok(atvv_bridge::BatteryPercentage::new(87))]),
+        ..Default::default()
+    };
+
+    Application::start(ConfigSelection::DefaultsOnly, &mut boundaries)
+        .expect("startup should succeed")
+        .run()
+        .expect("waiting should stop cleanly");
+
+    assert!(boundaries.battery_reads.is_empty());
 }
 
 #[test]

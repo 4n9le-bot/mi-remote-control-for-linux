@@ -12,9 +12,9 @@ pub mod desktop;
 pub mod system;
 
 pub use desktop::{
-    AtvvProfileReadiness, CaptureStatus, DesktopApplication, DesktopShell, DesktopStatus,
-    InProcessVoiceBridge, LatestDesktopStatus, RecentWavHandoff, RemoteStatus, VoiceBridge,
-    WavHandoffActivity,
+    AtvvProfileReadiness, BatteryStatus, CaptureStatus, DesktopApplication, DesktopShell,
+    DesktopStatus, InProcessVoiceBridge, LatestDesktopStatus, RecentWavHandoff, RecoveryStatus,
+    RemoteStatus, VoiceBridge, WavHandoffActivity,
 };
 
 pub(crate) const ATVV_SERVICE_UUID: &str = "ab5e0001-5a21-4f05-bc7d-af01f617b664";
@@ -106,6 +106,9 @@ pub fn select_profile(capabilities: &[u8]) -> Result<AtvvProfile, ProfileError> 
     if capabilities.len() != 9 || capabilities.first() != Some(&0x0B) {
         return Err(ProfileError::MalformedCapabilities);
     }
+    if capabilities[7..9] != [0x00, 0x00] {
+        return Err(ProfileError::MalformedCapabilities);
+    }
     if capabilities[1..3] != [0x01, 0x00] {
         return Err(ProfileError::UnsupportedVersion);
     }
@@ -117,9 +120,6 @@ pub fn select_profile(capabilities: &[u8]) -> Result<AtvvProfile, ProfileError> 
     }
     if capabilities[5..7] != [0x00, 0x78] {
         return Err(ProfileError::UnsupportedFrameShape);
-    }
-    if capabilities[7..9] != [0x00, 0x00] {
-        return Err(ProfileError::MalformedCapabilities);
     }
     Ok(AtvvProfile::XIAOMI_V1_HTT_16KHZ_120)
 }
@@ -238,6 +238,7 @@ fn attach_remote_from_snapshot(
 #[derive(Debug, Default)]
 pub struct AttachmentMonitor {
     ready_remote: Option<AttachedIdentity>,
+    unsupported_atvv_remote: Option<AttachedIdentity>,
     pending_attachment: Option<BluezSnapshot>,
     waiting_reported: bool,
 }
@@ -302,6 +303,25 @@ impl AttachmentMonitor {
                 None => (gatt.snapshot().map_err(AttachmentError::Inspect)?, false),
             };
             let attempted_identity = snapshot.online_remote().map(AttachedIdentity::from);
+            if self.unsupported_atvv_remote.is_some()
+                && self.unsupported_atvv_remote.as_ref() == attempted_identity.as_ref()
+            {
+                let Some(change) = gatt
+                    .wait_for_change_until(deadline)
+                    .map_err(AttachmentError::Wait)?
+                else {
+                    return Ok(None);
+                };
+                match change {
+                    AtvvChange::ConnectionChanged => {
+                        self.unsupported_atvv_remote = None;
+                        self.waiting_reported = true;
+                        return Ok(Some(AtvvEvent::WaitingForRemote));
+                    }
+                    AtvvChange::Stopped => return Ok(Some(AtvvEvent::Stopped)),
+                    _ => continue,
+                }
+            }
             if let (false, Some(remote)) = (is_pending, attempted_identity.as_ref()) {
                 let address = remote.address.clone();
                 self.pending_attachment = Some(snapshot);
@@ -309,6 +329,18 @@ impl AttachmentMonitor {
             }
             match attach_remote_from_snapshot(gatt, snapshot) {
                 Err(error) => {
+                    if let (Some(identity), AttachmentError::Profile(reason)) =
+                        (attempted_identity.clone(), &error)
+                    {
+                        if *reason != ProfileError::MalformedCapabilities {
+                            let address = identity.address.clone();
+                            self.unsupported_atvv_remote = Some(identity);
+                            return Ok(Some(AtvvEvent::UnsupportedProfile {
+                                address,
+                                reason: *reason,
+                            }));
+                        }
+                    }
                     let Ok(current_snapshot) = gatt.snapshot() else {
                         return Err(error);
                     };
@@ -490,6 +522,10 @@ pub enum AtvvEvent {
         address: String,
         profile: AtvvProfile,
     },
+    UnsupportedProfile {
+        address: String,
+        reason: ProfileError,
+    },
     ControlNotification(ControlNotification),
     AudioNotification(Vec<u8>),
     Stopped,
@@ -497,6 +533,20 @@ pub enum AtvvEvent {
 
 pub trait AtvvTransport {
     fn next_event(&mut self, deadline: Option<SystemTime>) -> io::Result<Option<AtvvEvent>>;
+    fn read_battery_percentage(&mut self, address: &str) -> io::Result<Option<BatteryPercentage>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryPercentage(u8);
+
+impl BatteryPercentage {
+    pub fn new(value: u8) -> Option<Self> {
+        (value <= 100).then_some(Self(value))
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -525,6 +575,7 @@ pub trait Storage {
 
 pub trait Clock {
     fn now(&self) -> SystemTime;
+    fn wait_until(&mut self, deadline: SystemTime) -> io::Result<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -546,6 +597,20 @@ pub enum OperationalEvent {
         at: SystemTime,
         address: String,
         profile: AtvvProfile,
+    },
+    AtvvRemoteRetryScheduled {
+        at: SystemTime,
+        next_attempt_at: SystemTime,
+        failure: String,
+    },
+    AtvvProfileUnsupported {
+        at: SystemTime,
+        address: String,
+        reason: ProfileError,
+    },
+    BatteryUpdated {
+        at: SystemTime,
+        percentage: Option<BatteryPercentage>,
     },
     CaptureStarted {
         at: SystemTime,
@@ -860,46 +925,96 @@ where
         let mut profile: Option<AtvvProfile> = None;
         let mut remote_address: Option<String> = None;
         let mut reject_starts_received_through: Option<SystemTime> = None;
+        let mut recovery_attempt = 0;
+        let mut battery_refresh_at: Option<SystemTime> = None;
         loop {
-            let deadline = capture.as_ref().map(|capture| {
+            let now = self.boundaries.now();
+            let capture_deadline = capture.as_ref().map(|capture| {
                 capture.started_at + Duration::from_secs(self.config.max_duration_secs)
             });
-            if deadline.is_some_and(|deadline| self.boundaries.now() >= deadline) {
+            if capture_deadline.is_some_and(|deadline| now >= deadline) {
                 reject_starts_received_through = self.process_pending_capture(
                     &mut capture,
-                    deadline.expect("Capture has a deadline"),
+                    capture_deadline.expect("Capture has a deadline"),
                 );
                 continue;
             }
-            let Some(event) = self.boundaries.next_event(deadline).map_err(RunError)? else {
-                reject_starts_received_through =
-                    self.process_pending_capture(&mut capture, self.boundaries.now());
+            if battery_refresh_at.is_some_and(|deadline| now >= deadline) {
+                if let Some(address) = remote_address.as_deref() {
+                    self.refresh_battery(address.to_owned(), now);
+                    battery_refresh_at = Some(now + Duration::from_secs(60 * 60));
+                } else {
+                    battery_refresh_at = None;
+                }
                 continue;
+            }
+            let deadline = [capture_deadline, battery_refresh_at]
+                .into_iter()
+                .flatten()
+                .min();
+            let event = match self.boundaries.next_event(deadline) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(error) => {
+                    capture = None;
+                    profile = None;
+                    let at = self.boundaries.now();
+                    let next_attempt_at = at + recovery_delay(recovery_attempt, at);
+                    recovery_attempt = recovery_attempt.saturating_add(1);
+                    self.boundaries
+                        .emit(OperationalEvent::AtvvRemoteRetryScheduled {
+                            at,
+                            next_attempt_at,
+                            failure: error.to_string(),
+                        });
+                    self.boundaries
+                        .wait_until(next_attempt_at)
+                        .map_err(RunError)?;
+                    continue;
+                }
             };
             let at = self.boundaries.now();
+            let mut refresh_battery_for = None;
             let operational_event = match event {
                 AtvvEvent::WaitingForRemote => {
                     capture = None;
                     profile = None;
                     remote_address = None;
+                    battery_refresh_at = None;
                     OperationalEvent::WaitingForRemote { at }
                 }
                 AtvvEvent::RemoteConnected { address } => {
+                    if remote_address.is_none() {
+                        recovery_attempt = 0;
+                    }
                     capture = None;
                     profile = None;
                     remote_address = Some(address.clone());
+                    refresh_battery_for = Some(address.clone());
+                    battery_refresh_at = Some(at + Duration::from_secs(60 * 60));
                     OperationalEvent::RemoteConnected { at, address }
                 }
                 AtvvEvent::RemoteReady {
                     address,
                     profile: negotiated_profile,
                 } => {
+                    recovery_attempt = 0;
                     profile = Some(negotiated_profile);
                     remote_address = Some(address.clone());
                     OperationalEvent::RemoteReady {
                         at,
                         address,
                         profile: negotiated_profile,
+                    }
+                }
+                AtvvEvent::UnsupportedProfile { address, reason } => {
+                    capture = None;
+                    profile = None;
+                    remote_address = Some(address.clone());
+                    OperationalEvent::AtvvProfileUnsupported {
+                        at,
+                        address,
+                        reason,
                     }
                 }
                 AtvvEvent::ControlNotification(notification) => {
@@ -988,7 +1103,19 @@ where
                 }
             };
             self.boundaries.emit(operational_event);
+            if let Some(address) = refresh_battery_for {
+                self.refresh_battery(address, at);
+            }
         }
+    }
+
+    fn refresh_battery(&mut self, address: String, at: SystemTime) {
+        let percentage = self
+            .boundaries
+            .read_battery_percentage(&address)
+            .unwrap_or(None);
+        self.boundaries
+            .emit(OperationalEvent::BatteryUpdated { at, percentage });
     }
 
     fn process_pending_capture(
@@ -1155,6 +1282,19 @@ where
             retained_wav,
         });
     }
+}
+
+fn recovery_delay(attempt: usize, at: SystemTime) -> Duration {
+    const SCHEDULE_SECONDS: [u64; 7] = [1, 2, 4, 8, 15, 30, 60];
+    let base = Duration::from_secs(SCHEDULE_SECONDS.get(attempt).copied().unwrap_or(60));
+    let maximum_jitter_millis = (base.as_millis() / 10) as u64;
+    let timestamp_seed = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let seed = timestamp_seed ^ (attempt as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let jitter_millis = seed % (maximum_jitter_millis + 1);
+    base + Duration::from_millis(jitter_millis)
 }
 
 fn voxtype_transcript(stdout: &str) -> Option<&str> {

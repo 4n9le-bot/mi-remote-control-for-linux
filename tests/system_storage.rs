@@ -5,9 +5,9 @@ use std::{
 };
 
 use atvv_bridge::{
-    AtvvProfile, AtvvProfileReadiness, CaptureStatus, DesktopStatus, IntegrationStage,
-    LatestDesktopStatus, OperationalEvent, OperationalEvents, RecentWavHandoff, RemoteStatus,
-    Storage, WavHandoffActivity, system::SystemBoundaries,
+    AtvvProfile, AtvvProfileReadiness, BatteryStatus, CaptureStatus, DesktopStatus,
+    IntegrationStage, LatestDesktopStatus, OperationalEvent, OperationalEvents, RecentWavHandoff,
+    RecoveryStatus, RemoteStatus, Storage, WavHandoffActivity, system::SystemBoundaries,
 };
 
 #[test]
@@ -70,6 +70,8 @@ fn operational_events_publish_complete_status_snapshots() {
                 stage: IntegrationStage::Transcription,
                 error: "voxtype failed".into(),
             },
+            recovery: RecoveryStatus::Idle,
+            battery: BatteryStatus::Unknown,
         })
     );
 }

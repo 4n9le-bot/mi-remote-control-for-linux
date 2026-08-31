@@ -19,9 +19,10 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
     ATVV_CHARACTERISTIC_UUIDS, AttachmentMonitor, AtvvChange, AtvvEvent, AtvvGatt, AtvvTransport,
-    BluezClient, BluezSnapshot, Clock, Command, CommandOutput, ControlNotification, DesktopStatus,
-    Device, GattCharacteristic, GattService, LatestDesktopStatus, OperationalEvent,
-    OperationalEvents, ProcessExecutor, Storage, get_caps_request,
+    BatteryPercentage, BluezClient, BluezSnapshot, Clock, Command, CommandOutput,
+    ControlNotification, DesktopStatus, Device, GattCharacteristic, GattService,
+    LatestDesktopStatus, OperationalEvent, OperationalEvents, ProcessExecutor, Storage,
+    get_caps_request,
 };
 
 static UNIQUE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -74,6 +75,25 @@ impl AtvvTransport for SystemBoundaries {
             .map_err(io::Error::other);
         self.attachment = attachment;
         result
+    }
+
+    fn read_battery_percentage(&mut self, address: &str) -> io::Result<Option<BatteryPercentage>> {
+        let objects = self.bluez_managed_objects()?;
+        for interfaces in objects.into_values() {
+            let Some(device) = interfaces.get("org.bluez.Device1") else {
+                continue;
+            };
+            if string_property(device, "Address").as_deref() != Some(address)
+                || bool_property(device, "Connected") != Some(true)
+            {
+                continue;
+            }
+            return Ok(interfaces
+                .get("org.bluez.Battery1")
+                .and_then(|battery| u8_property(battery, "Percentage"))
+                .and_then(BatteryPercentage::new));
+        }
+        Ok(None)
     }
 }
 
@@ -299,6 +319,18 @@ impl SystemBoundaries {
         }
         Ok(self.bluez.as_ref().expect("connection initialized").clone())
     }
+
+    fn bluez_managed_objects(&mut self) -> io::Result<zbus::fdo::ManagedObjects> {
+        let connection = self.bluez_connection()?;
+        let proxy = zbus::blocking::fdo::ObjectManagerProxy::builder(&connection)
+            .destination("org.bluez")
+            .map_err(io::Error::other)?
+            .path("/")
+            .map_err(io::Error::other)?
+            .build()
+            .map_err(io::Error::other)?;
+        proxy.get_managed_objects().map_err(io::Error::other)
+    }
 }
 
 fn characteristic_proxy<'a>(
@@ -330,15 +362,7 @@ async fn async_characteristic_proxy<'a>(
 
 impl BluezClient for SystemBoundaries {
     fn managed_objects(&mut self) -> io::Result<BluezSnapshot> {
-        let connection = self.bluez_connection()?;
-        let proxy = zbus::blocking::fdo::ObjectManagerProxy::builder(&connection)
-            .destination("org.bluez")
-            .map_err(io::Error::other)?
-            .path("/")
-            .map_err(io::Error::other)?
-            .build()
-            .map_err(io::Error::other)?;
-        let objects = proxy.get_managed_objects().map_err(io::Error::other)?;
+        let objects = self.bluez_managed_objects()?;
         let mut snapshot = BluezSnapshot::default();
 
         for (path, interfaces) in objects {
@@ -430,6 +454,13 @@ fn bool_property(
     bool::try_from(properties.get(name)?).ok()
 }
 
+fn u8_property(
+    properties: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    name: &str,
+) -> Option<u8> {
+    u8::try_from(properties.get(name)?).ok()
+}
+
 fn path_property(
     properties: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
     name: &str,
@@ -511,6 +542,16 @@ impl Clock for SystemBoundaries {
     fn now(&self) -> SystemTime {
         SystemTime::now()
     }
+
+    fn wait_until(&mut self, deadline: SystemTime) -> io::Result<()> {
+        while !self.shutdown_requested.load(Ordering::Relaxed) && SystemTime::now() < deadline {
+            let remaining = deadline
+                .duration_since(SystemTime::now())
+                .unwrap_or(Duration::ZERO);
+            thread::sleep(remaining.min(Duration::from_millis(250)));
+        }
+        Ok(())
+    }
 }
 
 impl OperationalEvents for SystemBoundaries {
@@ -548,6 +589,31 @@ impl OperationalEvents for SystemBoundaries {
                 "event=remote_ready at_unix_ms={} address={:?}",
                 unix_millis(at),
                 address
+            ),
+            OperationalEvent::AtvvRemoteRetryScheduled {
+                at,
+                next_attempt_at,
+                failure,
+            } => eprintln!(
+                "event=remote_retry_scheduled at_unix_ms={} next_attempt_unix_ms={} failure={:?}",
+                unix_millis(at),
+                unix_millis(next_attempt_at),
+                failure
+            ),
+            OperationalEvent::AtvvProfileUnsupported {
+                at,
+                address,
+                reason,
+            } => eprintln!(
+                "event=atvv_profile_unsupported at_unix_ms={} address={:?} reason={:?}",
+                unix_millis(at),
+                address,
+                reason
+            ),
+            OperationalEvent::BatteryUpdated { at, percentage } => eprintln!(
+                "event=battery_updated at_unix_ms={} percentage={:?}",
+                unix_millis(at),
+                percentage
             ),
             OperationalEvent::CaptureStarted { at, stream_id } => eprintln!(
                 "event=capture_started at_unix_ms={} stream_id={}",

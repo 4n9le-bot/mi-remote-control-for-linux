@@ -8,8 +8,9 @@ use adw::prelude::*;
 use atvv_bridge::Application;
 #[cfg(feature = "desktop")]
 use atvv_bridge::{
-    AtvvProfileReadiness, CaptureStatus, DesktopApplication, DesktopShell, DesktopStatus,
-    InProcessVoiceBridge, RecentWavHandoff, RemoteStatus, WavHandoffActivity, WavHandoffOutcome,
+    AtvvProfileReadiness, BatteryStatus, CaptureStatus, DesktopApplication, DesktopShell,
+    DesktopStatus, InProcessVoiceBridge, RecentWavHandoff, RecoveryStatus, RemoteStatus,
+    WavHandoffActivity, WavHandoffOutcome,
 };
 use atvv_bridge::{ConfigSelection, Readiness, check_readiness, system::SystemBoundaries};
 use clap::Parser;
@@ -131,6 +132,8 @@ struct StatusLabels {
     capture: gtk::Label,
     wav_handoff: gtk::Label,
     handoff: gtk::Label,
+    recovery: gtk::Label,
+    battery: gtk::Label,
 }
 
 #[cfg(feature = "desktop")]
@@ -166,12 +169,16 @@ impl DesktopShell for GtkDesktopShell {
             capture: status_label(""),
             wav_handoff: status_label(""),
             handoff: status_label(""),
+            recovery: status_label(""),
+            battery: status_label(""),
         };
         statuses.append(&status_labels.remote);
         statuses.append(&status_labels.profile);
         statuses.append(&status_labels.capture);
         statuses.append(&status_labels.wav_handoff);
         statuses.append(&status_labels.handoff);
+        statuses.append(&status_labels.recovery);
+        statuses.append(&status_labels.battery);
         self.window = Some(
             adw::ApplicationWindow::builder()
                 .application(application)
@@ -202,6 +209,7 @@ impl DesktopShell for GtkDesktopShell {
         let profile = match status.profile {
             AtvvProfileReadiness::Waiting => "ATVV Profile: Waiting",
             AtvvProfileReadiness::Ready { .. } => "ATVV Profile: Ready",
+            AtvvProfileReadiness::Unsupported { .. } => "ATVV Profile: Unsupported",
         };
         let capture = match status.capture {
             CaptureStatus::Idle => "Capture: Idle",
@@ -223,6 +231,23 @@ impl DesktopShell for GtkDesktopShell {
                 format!("Recent WAV Handoff: Failed ({stage:?}: {error})")
             }
         };
+        let recovery = match &status.recovery {
+            RecoveryStatus::Idle => "Recovery: Idle".into(),
+            RecoveryStatus::Retrying {
+                next_attempt_at,
+                failure,
+            } => format!(
+                "Recovery: Next attempt at Unix ms {} ({failure})",
+                next_attempt_at
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            ),
+        };
+        let battery = match status.battery {
+            BatteryStatus::Unknown => "Battery: Unknown".into(),
+            BatteryStatus::Percentage(percentage) => format!("Battery: {}%", percentage.get()),
+        };
         let labels = self
             .status_labels
             .as_ref()
@@ -232,5 +257,7 @@ impl DesktopShell for GtkDesktopShell {
         labels.capture.set_label(capture);
         labels.wav_handoff.set_label(wav_handoff);
         labels.handoff.set_label(&handoff);
+        labels.recovery.set_label(&recovery);
+        labels.battery.set_label(&battery);
     }
 }
