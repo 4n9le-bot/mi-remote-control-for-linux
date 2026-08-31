@@ -11,6 +11,7 @@ use thiserror::Error;
 pub mod button_mapping;
 pub mod desktop;
 pub mod helper_protocol;
+pub mod hwdb_mapping;
 pub mod system;
 
 pub use desktop::{

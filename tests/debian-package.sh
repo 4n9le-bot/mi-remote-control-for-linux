@@ -45,6 +45,7 @@ systemd-hwdb --root="$install_root" --strict update
 remote_modalias='evdev:input:b0005v2717p32B8e00A4-e0,1,4,14,k71,72,73,74,75'
 remote_properties=$(systemd-hwdb --root="$install_root" query "$remote_modalias")
 grep -Fxq 'KEYBOARD_KEY_7003e=reserved' <<<"$remote_properties"
+grep -Fxq 'KEYBOARD_KEY_70066=reserved' <<<"$remote_properties"
 
 menu_entry="$install_root/usr/share/applications/io.github.atvv_bridge.desktop"
 autostart_entry="$install_root/etc/xdg/autostart/io.github.atvv_bridge.desktop"
