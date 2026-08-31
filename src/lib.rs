@@ -8,7 +8,9 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
+pub mod button_mapping;
 pub mod desktop;
+pub mod helper_protocol;
 pub mod system;
 
 pub use desktop::{
