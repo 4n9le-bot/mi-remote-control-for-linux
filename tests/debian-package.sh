@@ -18,7 +18,9 @@ test -n "$package"
 
 contents=$(dpkg-deb --contents "$package")
 grep -Eq '[[:space:]]\./usr/bin/atvv-bridge$' <<<"$contents"
+grep -Eq '[[:space:]]\./usr/libexec/atvv-bridge/atvv-button-mapping-helper$' <<<"$contents"
 grep -Eq '[[:space:]]\./usr/lib/udev/hwdb.d/90-atvv-bridge.hwdb$' <<<"$contents"
+grep -Eq '[[:space:]]\./usr/share/polkit-1/actions/io.github.atvv_bridge.button-mapping.policy$' <<<"$contents"
 grep -Eq '[[:space:]]\./usr/share/applications/io.github.atvv_bridge.desktop$' <<<"$contents"
 grep -Eq '[[:space:]]\./etc/xdg/autostart/io.github.atvv_bridge.desktop$' <<<"$contents"
 ! grep -Eq '[[:space:]]\./usr/lib/systemd/user/atvv-bridge.service$' <<<"$contents"
@@ -61,6 +63,8 @@ fakeroot dpkg --root="$install_root" --admindir="$admin_dir" --log=/dev/null \
 test -f "$user_state/retained.wav"
 test -f "$user_config"
 test ! -e "$install_root/usr/bin/atvv-bridge"
+test ! -e "$install_root/usr/libexec/atvv-bridge/atvv-button-mapping-helper"
 test ! -e "$install_root/usr/lib/udev/hwdb.d/90-atvv-bridge.hwdb"
+test ! -e "$install_root/usr/share/polkit-1/actions/io.github.atvv_bridge.button-mapping.policy"
 test ! -e "$menu_entry"
 test ! -e "$autostart_entry"

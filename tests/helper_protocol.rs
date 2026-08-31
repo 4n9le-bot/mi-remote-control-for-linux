@@ -1,6 +1,7 @@
 use atvv_bridge::button_mapping::{ButtonId, MappingTarget};
 use atvv_bridge::helper_protocol::{
-    ProtocolError, Request, Response, StableErrorCode, decode_request, encode_response,
+    DecodedResponse, ProtocolError, Request, Response, StableErrorCode, decode_request,
+    decode_response, encode_request, encode_response,
 };
 
 fn envelope(operation: &str) -> String {
@@ -120,5 +121,66 @@ fn golden_error_envelopes_cover_every_stable_code() {
                 code.as_str()
             )
         );
+    }
+}
+
+#[test]
+fn request_encoding_round_trips_each_operation() {
+    let requests = [
+        Request::Inspect,
+        Request::Apply {
+            expected_revision: "sha256:old".into(),
+            mapping: atvv_bridge::button_mapping::Mapping::defaults(),
+        },
+        Request::Reset,
+    ];
+
+    for request in requests {
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()),
+            Ok(request)
+        );
+    }
+}
+
+#[test]
+fn response_decoding_is_strict_and_exposes_domain_results() {
+    let mapping = atvv_bridge::button_mapping::Mapping::defaults();
+    assert_eq!(
+        decode_response(&encode_response(&Response::inspect_success("r1", &mapping)).unwrap()),
+        Ok(DecodedResponse::Inspect {
+            revision: "r1".into(),
+            mapping,
+        })
+    );
+    assert_eq!(
+        decode_response(&encode_response(&Response::apply_success("r2")).unwrap()),
+        Ok(DecodedResponse::Apply {
+            revision: "r2".into(),
+        })
+    );
+    assert_eq!(
+        decode_response(&encode_response(&Response::reset_success("r3")).unwrap()),
+        Ok(DecodedResponse::Reset {
+            revision: "r3".into(),
+        })
+    );
+    assert_eq!(
+        decode_response(
+            &encode_response(&Response::error(StableErrorCode::RevisionConflict)).unwrap()
+        ),
+        Ok(DecodedResponse::Error(StableErrorCode::RevisionConflict))
+    );
+    assert_eq!(
+        decode_response(&encode_response(&Response::recovery_required()).unwrap()),
+        Ok(DecodedResponse::RecoveryRequired)
+    );
+
+    for invalid in [
+        br#"{}"#.as_slice(),
+        br#"{"protocol_version":1,"catalog_version":1,"ok":false,"result":{"kind":"error","code":"busy"}} trailing"#,
+        br#"{"protocol_version":1,"catalog_version":1,"ok":true,"result":{"kind":"success","operation":"apply","revision":"r","mapping":[]}}"#,
+    ] {
+        assert_eq!(decode_response(invalid), Err(ProtocolError::InvalidRequest));
     }
 }

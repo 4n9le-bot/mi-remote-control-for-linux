@@ -32,3 +32,7 @@ desktop = ["dep:adw", "dep:gtk", "dep:ksni"]
 name = "atvv-bridge"
 path = "src/main.rs"
 required-features = ["desktop"]
+
+[[bin]]
+name = "atvv-button-mapping-helper"
+path = "src/bin/atvv-button-mapping-helper.rs"

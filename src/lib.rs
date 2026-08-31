@@ -9,6 +9,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 pub mod button_mapping;
+pub mod button_mapping_backend;
 pub mod desktop;
 pub mod helper_protocol;
 pub mod hwdb_mapping;

@@ -28,12 +28,16 @@ cargo build --manifest-path "$repo_dir/Cargo.toml" --release --locked
 package_root="$build_dir/debian/$package_name"
 install -Dm755 "$target_dir/release/atvv-bridge" \
     "$package_root/usr/bin/atvv-bridge"
+install -Dm755 "$target_dir/release/atvv-button-mapping-helper" \
+    "$package_root/usr/libexec/atvv-bridge/atvv-button-mapping-helper"
 install -Dm644 "$repo_dir/packaging/90-atvv-bridge.hwdb" \
     "$package_root/usr/lib/udev/hwdb.d/90-atvv-bridge.hwdb"
 install -Dm644 "$repo_dir/packaging/io.github.atvv_bridge.desktop" \
     "$package_root/usr/share/applications/io.github.atvv_bridge.desktop"
 install -Dm644 "$repo_dir/packaging/io.github.atvv_bridge-autostart.desktop" \
     "$package_root/etc/xdg/autostart/io.github.atvv_bridge.desktop"
+install -Dm644 "$repo_dir/packaging/io.github.atvv_bridge.button-mapping.policy" \
+    "$package_root/usr/share/polkit-1/actions/io.github.atvv_bridge.button-mapping.policy"
 install -Dm644 "$repo_dir/README.md" \
     "$package_root/usr/share/doc/atvv-bridge/README.md"
 
@@ -52,7 +56,9 @@ EOF
 
 shlib_output=$(
     cd "$build_dir"
-    dpkg-shlibdeps -O -e"debian/$package_name/usr/bin/atvv-bridge"
+    dpkg-shlibdeps -O \
+        -e"debian/$package_name/usr/bin/atvv-bridge" \
+        -e"debian/$package_name/usr/libexec/atvv-bridge/atvv-button-mapping-helper"
 )
 dependencies=${shlib_output#shlibs:Depends=}
 installed_size=$(du -sk "$package_root" | cut -f1)

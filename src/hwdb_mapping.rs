@@ -24,6 +24,10 @@ pub enum InspectOutcome {
 pub struct MappingRevision(String);
 
 impl MappingRevision {
+    pub fn from_opaque(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
