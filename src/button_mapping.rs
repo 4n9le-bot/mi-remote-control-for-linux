@@ -3,14 +3,26 @@ use std::{collections::BTreeMap, fmt};
 mod generated;
 pub use generated::{
     LOGICAL_KEYS, REGISTRY_CATALOG_VERSION, REGISTRY_LICENSE, REGISTRY_LINUX_TAG,
-    REGISTRY_SOURCE_SHA256,
+    REGISTRY_SOURCE_SHA256, REGISTRY_SOURCE_URL,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogicalKey {
-    pub symbol: &'static str,
-    pub code: u16,
-    pub label: &'static str,
+    symbol: &'static str,
+    code: u16,
+    label: &'static str,
+}
+
+impl LogicalKey {
+    pub const fn symbol(self) -> &'static str {
+        self.symbol
+    }
+    pub const fn code(self) -> u16 {
+        self.code
+    }
+    pub const fn label(self) -> &'static str {
+        self.label
+    }
 }
 
 pub const CATALOG_VERSION: u32 = 1;
@@ -122,6 +134,13 @@ impl ButtonCatalog {
     }
 }
 
+fn catalog_button(id: ButtonId) -> &'static PhysicalButton {
+    ButtonCatalog::v1()
+        .iter()
+        .find(|button| button.id == id)
+        .expect("every catalog button has metadata")
+}
+
 impl ButtonId {
     pub const ALL: [Self; 11] = [
         Self::Power,
@@ -151,35 +170,11 @@ impl ButtonId {
             Self::Live => "live",
         }
     }
-    pub const fn scan_code(self) -> &'static str {
-        match self {
-            Self::Power => "70066",
-            Self::Confirm => "70028",
-            Self::Up => "70052",
-            Self::Down => "70051",
-            Self::Left => "70050",
-            Self::Right => "7004f",
-            Self::Back => "700f1",
-            Self::VolumeUp => "70080",
-            Self::VolumeDown => "70081",
-            Self::Menu => "70065",
-            Self::Live => "70035",
-        }
+    pub fn scan_code(self) -> &'static str {
+        catalog_button(self).scan_code
     }
-    pub const fn native_key(self) -> &'static str {
-        match self {
-            Self::Power => "KEY_POWER",
-            Self::Confirm => "KEY_ENTER",
-            Self::Up => "KEY_UP",
-            Self::Down => "KEY_DOWN",
-            Self::Left => "KEY_LEFT",
-            Self::Right => "KEY_RIGHT",
-            Self::Back => "KEY_BACK",
-            Self::VolumeUp => "KEY_VOLUMEUP",
-            Self::VolumeDown => "KEY_VOLUMEDOWN",
-            Self::Menu => "KEY_COMPOSE",
-            Self::Live => "KEY_GRAVE",
-        }
+    pub fn native_key(self) -> &'static str {
+        catalog_button(self).native_key
     }
     pub const fn default_target(self) -> MappingTarget {
         if matches!(self, Self::Power) {
@@ -213,6 +208,7 @@ pub struct Mapping(BTreeMap<ButtonId, MappingTarget>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MappingError {
     MissingButton(ButtonId),
+    DuplicateButton(ButtonId),
     UnknownButton,
     InvalidKey,
 }
@@ -229,7 +225,12 @@ impl Mapping {
     pub fn from_entries(
         entries: impl IntoIterator<Item = (ButtonId, MappingTarget)>,
     ) -> Result<Self, MappingError> {
-        let map: BTreeMap<_, _> = entries.into_iter().collect();
+        let mut map = BTreeMap::new();
+        for (button, target) in entries {
+            if map.insert(button, target).is_some() {
+                return Err(MappingError::DuplicateButton(button));
+            }
+        }
         for id in ButtonId::ALL {
             if !map.contains_key(&id) {
                 return Err(MappingError::MissingButton(id));
@@ -238,7 +239,12 @@ impl Mapping {
         if map.len() != ButtonId::ALL.len() {
             return Err(MappingError::UnknownButton);
         }
-        if map.values().any(|target| matches!(target, MappingTarget::Key(key) if !LOGICAL_KEYS.iter().any(|candidate| candidate.symbol == key.symbol && candidate.code == key.code))) { return Err(MappingError::InvalidKey); }
+        if map
+            .values()
+            .any(|target| matches!(target, MappingTarget::Key(key) if !LOGICAL_KEYS.contains(key)))
+        {
+            return Err(MappingError::InvalidKey);
+        }
         Ok(Self(map))
     }
     pub fn get(&self, id: ButtonId) -> MappingTarget {

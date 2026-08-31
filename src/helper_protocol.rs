@@ -153,7 +153,7 @@ pub fn decode_request(input: &[u8]) -> Result<Request, ProtocolError> {
                     WireTarget::Key { key } => MappingTarget::Key(
                         *LOGICAL_KEYS
                             .iter()
-                            .find(|candidate| candidate.symbol == key)
+                            .find(|candidate| candidate.symbol() == key)
                             .ok_or(ProtocolError::InvalidMapping)?,
                     ),
                 };
@@ -173,40 +173,91 @@ pub fn decode_request(input: &[u8]) -> Result<Request, ProtocolError> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Response {
-    pub protocol_version: u32,
-    pub catalog_version: u32,
-    pub ok: bool,
-    pub result: ResponseResult,
+    protocol_version: u32,
+    catalog_version: u32,
+    ok: bool,
+    result: ResponseResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ResponseResult {
+enum ResponseResult {
     Success {
-        operation: String,
+        operation: Operation,
         revision: Option<String>,
         mapping: Option<Vec<WireEntryOut>>,
     },
     Error {
-        code: String,
+        code: StableErrorCode,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct WireEntryOut {
-    pub button: String,
-    pub target: String,
-    pub key: Option<String>,
+struct WireEntryOut {
+    button: &'static str,
+    target: WireTargetOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Operation {
+    Inspect,
+    Apply,
+    Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireTargetOut {
+    Original,
+    Disabled,
+    Key { key: &'static str },
 }
 
 impl Response {
+    pub fn inspect_success(revision: impl Into<String>, mapping: &Mapping) -> Self {
+        Self::success(Operation::Inspect, Some(revision.into()), Some(mapping))
+    }
+
+    pub fn apply_success(revision: impl Into<String>) -> Self {
+        Self::success(Operation::Apply, Some(revision.into()), None)
+    }
+
+    pub fn reset_success(revision: impl Into<String>) -> Self {
+        Self::success(Operation::Reset, Some(revision.into()), None)
+    }
+
     pub fn error(code: StableErrorCode) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             catalog_version: CATALOG_VERSION,
             ok: false,
-            result: ResponseResult::Error {
-                code: code.as_str().into(),
+            result: ResponseResult::Error { code },
+        }
+    }
+
+    fn success(operation: Operation, revision: Option<String>, mapping: Option<&Mapping>) -> Self {
+        let mapping = mapping.map(|mapping| {
+            mapping
+                .iter()
+                .map(|(button, target)| WireEntryOut {
+                    button: button.as_str(),
+                    target: match target {
+                        MappingTarget::Original => WireTargetOut::Original,
+                        MappingTarget::Disabled => WireTargetOut::Disabled,
+                        MappingTarget::Key(key) => WireTargetOut::Key { key: key.symbol() },
+                    },
+                })
+                .collect()
+        });
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            catalog_version: CATALOG_VERSION,
+            ok: true,
+            result: ResponseResult::Success {
+                operation,
+                revision,
+                mapping,
             },
         }
     }

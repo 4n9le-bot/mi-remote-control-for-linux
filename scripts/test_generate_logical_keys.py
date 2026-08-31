@@ -15,10 +15,11 @@ class GeneratorTests(unittest.TestCase):
             output = Path(directory) / "generated.rs"
             generate_logical_keys.main = generate_logical_keys.main
             import subprocess, sys
-            subprocess.run([sys.executable, str(Path(__file__).parent / "generate_logical_keys.py"), str(FIXTURE), str(output), "--linux-tag", "v6.16", "--catalog-version", "1"], check=True)
+            subprocess.run([sys.executable, str(Path(__file__).parent / "generate_logical_keys.py"), str(FIXTURE), str(output), "--linux-tag", "v6.16", "--source-url", "https://example.invalid/pinned.h", "--catalog-version", "1"], check=True)
             generated = output.read_text()
             self.assertIn('REGISTRY_LINUX_TAG: &str = "v6.16"', generated)
             self.assertIn('REGISTRY_SOURCE_SHA256', generated)
+            self.assertIn('REGISTRY_SOURCE_URL: &str = "https://example.invalid/pinned.h"', generated)
             self.assertIn('REGISTRY_LICENSE', generated)
             self.assertNotIn('KEY_RESERVED', generated)
             self.assertNotIn('KEY_UNKNOWN', generated)
