@@ -1,0 +1,52 @@
+<!doctype html>
+<!-- THROWAWAY UI PROTOTYPE: Three status-window variants, switchable via ?variant=A|B|C. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ATVV Remote status window prototype</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #16181d; color: #f2f3f5; }
+      * { box-sizing: border-box; } body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+      main { width: min(760px, calc(100vw - 32px)); min-height: 540px; padding: 32px; border: 1px solid #3b404b; border-radius: 18px; background: #22252c; box-shadow: 0 24px 70px #0008; }
+      h1, h2, p { margin-top: 0; } h1 { font-size: 24px; } h2 { font-size: 16px; color: #b8beca; letter-spacing: .03em; }
+      button { border: 1px solid #505867; border-radius: 8px; padding: 9px 12px; color: inherit; background: #303641; font: inherit; cursor: pointer; }
+      button.primary { background: #4c83e7; border-color: #6697ed; } .muted { color: #aeb5c2; } .ok { color: #75dc9d; } .warn { color: #ffd071; }
+      .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; } .spread { justify-content: space-between; } .card { padding: 18px; border: 1px solid #3d4450; border-radius: 12px; background: #2a2e36; }
+      .pill { display: inline-flex; gap: 8px; align-items: center; border-radius: 100px; padding: 6px 10px; background: #183927; color: #84e4a9; font-weight: 650; } .dot { width: 9px; height: 9px; background: currentColor; border-radius: 50%; }
+      .metric { font-size: 44px; font-weight: 720; line-height: 1; } .label { color: #aeb5c2; font-size: 13px; } .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; } .stack { display: grid; gap: 14px; }
+      .battery { height: 10px; overflow: hidden; border-radius: 20px; background: #454c59; } .battery > i { display: block; width: 72%; height: 100%; background: #75dc9d; }
+      .steps { display: grid; gap: 0; } .step { display: grid; grid-template-columns: 28px 1fr auto; gap: 12px; padding: 13px 0; border-bottom: 1px solid #3d4450; } .step:last-child { border: 0; } .step b { color: #75dc9d; }
+      .tray { width: 260px; margin: 16px auto 0; padding: 10px; background: #15171b; border: 1px solid #4a5260; border-radius: 10px; } .tray div { padding: 8px; } .tray hr { border: 0; border-top: 1px solid #3d4450; }
+      .side { display: grid; grid-template-columns: 190px 1fr; gap: 26px; } .nav button { width: 100%; text-align: left; margin: 4px 0; background: transparent; border-color: transparent; } .nav button:first-child { background: #36496f; }
+      .switcher { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 12px; padding: 8px; border: 1px solid #657080; border-radius: 999px; background: #0d0f13; box-shadow: 0 8px 30px #0009; } .switcher strong { min-width: 190px; text-align: center; }
+      pre { overflow: auto; padding: 12px; border-radius: 8px; background: #17191e; color: #b8c8e8; font-size: 12px; }
+      @media (max-width: 560px) { main { padding: 22px; } .grid, .side { grid-template-columns: 1fr; } .side { gap: 10px; } .nav { display: flex; } .nav button { width: auto; } }
+    </style>
+  </head>
+  <body>
+    <main id="app"></main>
+    <nav class="switcher" aria-label="Prototype variant switcher">
+      <button id="previous" aria-label="Previous variant">←</button>
+      <strong id="variant-name"></strong>
+      <button id="next" aria-label="Next variant">→</button>
+    </nav>
+    <script>
+      const remote = { connection: "Connected", profile: "Ready", capture: "Idle", battery: "72%", batteryUpdated: "2 minutes ago", retry: "Not scheduled" };
+      const variants = ["A", "B", "C"];
+      const names = { A: "A — At-a-glance", B: "B — Connection journey", C: "C — Tray-first control panel" };
+      let variant = new URLSearchParams(location.search).get("variant") || "A";
+      if (!variants.includes(variant)) variant = "A";
+      const state = `<pre>${JSON.stringify(remote, null, 2)}</pre>`;
+      const tray = `<div class="tray"><div><b>● ATVV Remote</b> <span class="ok">Connected</span></div><div>Battery: 72%</div><hr><div>Show status window</div><div>Run diagnostics</div><hr><div>Quit ATVV Voice Bridge</div></div>`;
+      const a = () => `<div class="row spread"><div><h1>ATVV Voice Bridge</h1><p class="muted">Your remote is ready for voice input.</p></div><button>Run diagnostics</button></div><section class="card" style="margin:24px 0"><span class="pill"><i class="dot"></i>ATVV Remote connected</span><h2 style="margin-top:20px">Xiaomi Bluetooth Remote</h2><p class="muted">ATVV Profile ready · Capture idle</p></section><section class="grid"><article class="card"><span class="label">Battery</span><p class="metric">72%</p><div class="battery"><i></i></div><p class="muted" style="margin:10px 0 0">Updated 2 minutes ago</p></article><article class="card"><span class="label">Recovery</span><p class="metric ok" style="font-size:28px">Healthy</p><p class="muted">No retry is scheduled.</p></article></section><h2 style="margin-top:24px">Tray menu preview</h2>${tray}${state}`;
+      const b = () => `<div class="row spread"><div><h1>Remote connection</h1><p class="muted">Everything needed before a Capture can begin.</p></div><span class="pill"><i class="dot"></i>Ready</span></div><section class="card" style="margin-top:24px"><div class="steps"><div class="step"><b>✓</b><div><strong>Bluetooth connection</strong><br><span class="muted">Xiaomi Bluetooth Remote</span></div><span class="ok">Connected</span></div><div class="step"><b>✓</b><div><strong>ATVV Profile</strong><br><span class="muted">Voice protocol negotiated</span></div><span class="ok">Ready</span></div><div class="step"><b>•</b><div><strong>Capture</strong><br><span class="muted">Waiting for voice button</span></div><span>Idle</span></div></div></section><section class="card" style="margin-top:14px"><div class="row spread"><div><h2>Battery</h2><p class="metric" style="font-size:30px;margin-bottom:0">72%</p></div><div class="muted">Last read<br>2 minutes ago</div></div><div class="battery" style="margin-top:14px"><i></i></div></section><div class="row" style="margin-top:18px"><button class="primary">Run diagnostics</button><button>Reconnect now</button></div>${state}`;
+      const c = () => `<div class="side"><aside class="nav"><button>● Status</button><button>Diagnostics</button><button>About</button></aside><div><h1>ATVV Remote</h1><section class="card"><div class="row spread"><div><span class="label">Connection</span><p class="ok" style="font-size:22px;font-weight:700;margin:6px 0">Connected</p></div><button>Disconnect</button></div><hr style="border-color:#3d4450"><div class="grid"><div><span class="label">Battery</span><p style="font-size:26px;margin:6px 0">72%</p><div class="battery"><i></i></div></div><div><span class="label">Voice input</span><p style="margin:6px 0">Capture idle</p><span class="muted">Ready when held</span></div></div></section><h2 style="margin-top:22px">Background behavior</h2><p class="muted">Closing this window keeps the bridge active in the system tray.</p>${tray}<details><summary>Operational state</summary>${state}</details></div></div>`;
+      function render() { document.querySelector("#app").innerHTML = ({ A:a, B:b, C:c })[variant](); document.querySelector("#variant-name").textContent = names[variant]; }
+      function move(offset) { variant = variants[(variants.indexOf(variant) + offset + variants.length) % variants.length]; const url = new URL(location); url.searchParams.set("variant", variant); history.replaceState({}, "", url); render(); }
+      document.querySelector("#previous").onclick = () => move(-1); document.querySelector("#next").onclick = () => move(1);
+      addEventListener("keydown", (event) => { if (["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) return; if (event.key === "ArrowLeft") move(-1); if (event.key === "ArrowRight") move(1); });
+      render();
+    </script>
+  </body>
+</html>
