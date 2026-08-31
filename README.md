@@ -116,13 +116,56 @@ Invalid configuration is shown as an actionable failure in the status window.
 After saving a valid replacement, the running desktop application detects it
 and reinitializes the bridge automatically.
 
+## Map remote buttons
+
+Open **Button Mapping** from the application header or tray menu. The supported
+Physical Buttons are Power, Confirm, Up, Down, Left, Right, Back, Volume Up,
+Volume Down, Menu, and Live. Voice is deliberately excluded: it remains reserved
+for ATVV Capture and cannot be remapped.
+
+Each Physical Button can **Keep Original**, become **Disabled**, or emit any
+Logical Key from the complete searchable Linux key catalog. Changes remain a
+Draft Mapping until **Apply** is selected. A Button Mapping is system-wide, so
+it affects every user after the ATVV Remote reconnects. Applying or restoring
+defaults uses a one-shot administrator authorization; permission is not retained.
+Canceling authorization preserves the Draft Mapping. A successful write changes
+the Installed Mapping but does not affect the already-connected input device:
+disconnect and reconnect the remote to activate it.
+
+Power defaults to Disabled because its native `KEY_POWER` action may suspend or
+shut down the computer. Enabling **Keep Original** for Power shows an explicit
+warning. **Reset All** and **Restore Defaults** return Power to Disabled.
+
+### Button Mapping recovery
+
+- **Busy**: another mapping operation owns the system lock. Wait for it to
+  finish, then retry; staged edits are preserved.
+- **Authorization not granted**: canceling or denying the system prompt makes no
+  change. Apply again when administrator authorization is available.
+- **Unsupported system**: Button Mapping is unavailable when the required hwdb
+  catalog or runtime tools are unsupported. Voice input remains available;
+  install the supported package/runtime before retrying.
+- **Revision conflict**: the Installed Mapping changed after this Draft Mapping
+  was loaded. Choose **Reload**, confirm loss of staged edits, then recreate and
+  apply the desired changes.
+- **RecoveryRequired**: the managed source and compiled hwdb cannot be trusted as
+  a consistent pair. Editing and Apply remain disabled; use **Restore Defaults**.
+- **Rollback failure**: recovery could not restore the previous Installed
+  Mapping. Treat the state as RecoveryRequired and use **Restore Defaults**. If
+  that also fails, retain the diagnostics and repair the system hwdb tooling
+  before retrying.
+
+The release-time certified-device procedure is documented in the
+[Button Mapping hardware acceptance checklist](docs/hardware/button-mapping-acceptance-checklist.md).
+
 ## Remove
 
 ```sh
 sudo apt remove atvv-bridge
 ```
 
-Package removal preserves user configuration and retained WAV files. Reconnect
-the remote after removal to restore native button behavior. Removal and purge
-delete only the Button Mapping override managed by ATVV Voice Bridge; unrelated
-hwdb files are preserved.
+`apt remove` deletes the Installed Mapping. Package removal preserves user
+configuration and retained WAV files; reconnect the remote afterward to restore
+native non-voice button behavior. Removal and purge delete only the Button
+Mapping override managed by ATVV Voice Bridge; unrelated hwdb files are
+preserved.
