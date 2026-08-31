@@ -227,6 +227,15 @@ fn monitor_waits_without_failing_and_attaches_when_a_remote_appears() {
             .next_event(&mut gatt, None)
             .map(|event| event.expect("unlimited wait should produce an event"))
             .expect("attachment should succeed"),
+        AtvvEvent::RemoteConnected {
+            address: "AA:BB:CC:DD:EE:FF".into(),
+        }
+    );
+    assert_eq!(
+        monitor
+            .next_event(&mut gatt, None)
+            .map(|event| event.expect("unlimited wait should produce an event"))
+            .expect("attachment should succeed"),
         AtvvEvent::RemoteReady {
             address: "AA:BB:CC:DD:EE:FF".into(),
             profile: AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
@@ -266,10 +275,18 @@ fn gatt_removal_during_attachment_returns_to_waiting_and_retries() {
     };
     let mut monitor = AttachmentMonitor::default();
 
-    assert_eq!(
+    assert!(matches!(
+        monitor.next_event(&mut gatt, None).unwrap().unwrap(),
+        AtvvEvent::RemoteConnected { .. }
+    ));
+    assert!(matches!(
         monitor.next_event(&mut gatt, None).unwrap().unwrap(),
         AtvvEvent::WaitingForRemote
-    );
+    ));
+    assert!(matches!(
+        monitor.next_event(&mut gatt, None).unwrap().unwrap(),
+        AtvvEvent::RemoteConnected { .. }
+    ));
     assert!(matches!(
         monitor.next_event(&mut gatt, None).unwrap().unwrap(),
         AtvvEvent::RemoteReady { .. }
@@ -293,9 +310,13 @@ fn monitor_does_not_report_ready_when_capability_negotiation_fails() {
     };
     let mut monitor = AttachmentMonitor::default();
 
+    assert!(matches!(
+        monitor.next_event(&mut gatt, None).unwrap().unwrap(),
+        AtvvEvent::RemoteConnected { .. }
+    ));
     let error = monitor
         .next_event(&mut gatt, None)
-        .map(|event| event.expect("unlimited wait should produce an event"))
+        .map(|event| event.expect("attachment should be attempted"))
         .expect_err("an uncertified profile must fail closed");
 
     assert!(matches!(
@@ -450,9 +471,14 @@ fn next_event(
     monitor: &mut AttachmentMonitor,
     gatt: &mut ControlledGatt,
 ) -> Result<AtvvEvent, AttachmentError> {
-    monitor
-        .next_event(gatt, None)
-        .map(|event| event.expect("unlimited wait should produce an event"))
+    loop {
+        let event = monitor
+            .next_event(gatt, None)
+            .map(|event| event.expect("unlimited wait should produce an event"))?;
+        if !matches!(event, AtvvEvent::RemoteConnected { .. }) {
+            return Ok(event);
+        }
+    }
 }
 
 fn ready_snapshot() -> BluezSnapshot {

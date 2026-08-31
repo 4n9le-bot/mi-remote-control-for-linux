@@ -19,9 +19,9 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
     ATVV_CHARACTERISTIC_UUIDS, AttachmentMonitor, AtvvChange, AtvvEvent, AtvvGatt, AtvvTransport,
-    BluezClient, BluezSnapshot, Clock, Command, CommandOutput, ControlNotification, Device,
-    GattCharacteristic, GattService, OperationalEvent, OperationalEvents, ProcessExecutor, Storage,
-    get_caps_request,
+    BluezClient, BluezSnapshot, Clock, Command, CommandOutput, ControlNotification, DesktopStatus,
+    Device, GattCharacteristic, GattService, LatestDesktopStatus, OperationalEvent,
+    OperationalEvents, ProcessExecutor, Storage, get_caps_request,
 };
 
 static UNIQUE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +34,17 @@ pub struct SystemBoundaries {
     notification_roles: HashMap<String, NotificationRole>,
     shutdown_requested: Arc<AtomicBool>,
     signal_handlers_installed: bool,
+    status: DesktopStatus,
+    status_updates: Option<LatestDesktopStatus>,
+}
+
+impl SystemBoundaries {
+    pub fn with_status_updates(status_updates: LatestDesktopStatus) -> Self {
+        Self {
+            status_updates: Some(status_updates),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -504,6 +515,10 @@ impl Clock for SystemBoundaries {
 
 impl OperationalEvents for SystemBoundaries {
     fn emit(&mut self, event: OperationalEvent) {
+        self.status = std::mem::take(&mut self.status).transitioned_by(&event);
+        if let Some(updates) = &self.status_updates {
+            updates.publish(self.status.clone());
+        }
         match event {
             OperationalEvent::DaemonStarted {
                 at,
@@ -520,10 +535,31 @@ impl OperationalEvents for SystemBoundaries {
             OperationalEvent::WaitingForRemote { at } => {
                 eprintln!("event=waiting_for_remote at_unix_ms={}", unix_millis(at))
             }
-            OperationalEvent::RemoteReady { at, address } => eprintln!(
+            OperationalEvent::RemoteConnected { at, address } => eprintln!(
+                "event=remote_connected at_unix_ms={} address={:?}",
+                unix_millis(at),
+                address
+            ),
+            OperationalEvent::RemoteReady {
+                at,
+                address,
+                profile: _,
+            } => eprintln!(
                 "event=remote_ready at_unix_ms={} address={:?}",
                 unix_millis(at),
                 address
+            ),
+            OperationalEvent::CaptureStarted { at, stream_id } => eprintln!(
+                "event=capture_started at_unix_ms={} stream_id={}",
+                unix_millis(at),
+                stream_id
+            ),
+            OperationalEvent::CaptureStopped { at } => {
+                eprintln!("event=capture_stopped at_unix_ms={}", unix_millis(at))
+            }
+            OperationalEvent::WavHandoffStarted { at } => eprintln!(
+                "event=wav_handoff_started at_unix_ms={} state=active",
+                unix_millis(at)
             ),
             OperationalEvent::CaptureCompleted {
                 at,

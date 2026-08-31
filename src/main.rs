@@ -1,14 +1,17 @@
 #[cfg(feature = "desktop")]
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, time::Duration};
 use std::{env, path::PathBuf, process::ExitCode};
 
 #[cfg(feature = "desktop")]
 use adw::prelude::*;
 #[cfg(not(feature = "desktop"))]
 use atvv_bridge::Application;
-use atvv_bridge::{ConfigSelection, Readiness, check_readiness, system::SystemBoundaries};
 #[cfg(feature = "desktop")]
-use atvv_bridge::{DesktopApplication, DesktopShell, InProcessVoiceBridge};
+use atvv_bridge::{
+    AtvvProfileReadiness, CaptureStatus, DesktopApplication, DesktopShell, DesktopStatus,
+    InProcessVoiceBridge, RecentWavHandoff, RemoteStatus, WavHandoffActivity, WavHandoffOutcome,
+};
+use atvv_bridge::{ConfigSelection, Readiness, check_readiness, system::SystemBoundaries};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -42,11 +45,22 @@ fn main() {
     let application = adw::Application::builder()
         .application_id("io.github.atvv_bridge")
         .build();
+    let activated_desktop = Rc::clone(&desktop);
+    let activated_shell = Rc::clone(&shell);
     application.connect_activate(move |application| {
-        shell.borrow_mut().set_application(application);
-        if let Err(error) = desktop.borrow_mut().activate(&mut *shell.borrow_mut()) {
+        activated_shell.borrow_mut().set_application(application);
+        if let Err(error) = activated_desktop
+            .borrow_mut()
+            .activate(&mut *activated_shell.borrow_mut())
+        {
             eprintln!("atvv-bridge: could not start the desktop application: {error}");
         }
+    });
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+        desktop
+            .borrow_mut()
+            .refresh_status(&mut *shell.borrow_mut());
+        gtk::glib::ControlFlow::Continue
     });
     application.run_with_args(&["atvv-bridge"]);
 }
@@ -107,6 +121,16 @@ fn run_check() -> ExitCode {
 struct GtkDesktopShell {
     application: Option<adw::Application>,
     window: Option<adw::ApplicationWindow>,
+    status_labels: Option<StatusLabels>,
+}
+
+#[cfg(feature = "desktop")]
+struct StatusLabels {
+    remote: gtk::Label,
+    profile: gtk::Label,
+    capture: gtk::Label,
+    wav_handoff: gtk::Label,
+    handoff: gtk::Label,
 }
 
 #[cfg(feature = "desktop")]
@@ -123,23 +147,42 @@ impl DesktopShell for GtkDesktopShell {
             .application
             .as_ref()
             .expect("GTK application is set before activation");
+        let statuses = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        statuses.set_margin_top(24);
+        statuses.set_margin_bottom(24);
+        statuses.set_margin_start(24);
+        statuses.set_margin_end(24);
+        let status_label = |text| {
+            gtk::Label::builder()
+                .label(text)
+                .xalign(0.0)
+                .selectable(true)
+                .wrap(true)
+                .build()
+        };
+        let status_labels = StatusLabels {
+            remote: status_label(""),
+            profile: status_label(""),
+            capture: status_label(""),
+            wav_handoff: status_label(""),
+            handoff: status_label(""),
+        };
+        statuses.append(&status_labels.remote);
+        statuses.append(&status_labels.profile);
+        statuses.append(&status_labels.capture);
+        statuses.append(&status_labels.wav_handoff);
+        statuses.append(&status_labels.handoff);
         self.window = Some(
             adw::ApplicationWindow::builder()
                 .application(application)
                 .title("ATVV Voice Bridge")
                 .default_width(360)
-                .default_height(180)
-                .content(
-                    &gtk::Label::builder()
-                        .label("ATVV Voice Bridge is starting.")
-                        .margin_top(24)
-                        .margin_bottom(24)
-                        .margin_start(24)
-                        .margin_end(24)
-                        .build(),
-                )
+                .default_height(220)
+                .content(&statuses)
                 .build(),
         );
+        self.status_labels = Some(status_labels);
+        self.display_status(&DesktopStatus::default());
     }
 
     fn present_status_window(&mut self) {
@@ -147,5 +190,47 @@ impl DesktopShell for GtkDesktopShell {
             .as_ref()
             .expect("status window is created before presentation")
             .present();
+    }
+
+    fn display_status(&mut self, status: &DesktopStatus) {
+        let remote = match &status.remote {
+            RemoteStatus::Waiting => "ATVV Remote: Waiting".into(),
+            RemoteStatus::Connected { address } => {
+                format!("ATVV Remote: Connected ({address})")
+            }
+        };
+        let profile = match status.profile {
+            AtvvProfileReadiness::Waiting => "ATVV Profile: Waiting",
+            AtvvProfileReadiness::Ready { .. } => "ATVV Profile: Ready",
+        };
+        let capture = match status.capture {
+            CaptureStatus::Idle => "Capture: Idle",
+            CaptureStatus::Active => "Capture: Active",
+        };
+        let wav_handoff = match status.wav_handoff {
+            WavHandoffActivity::Idle => "WAV Handoff: Idle",
+            WavHandoffActivity::Active => "WAV Handoff: Active",
+        };
+        let handoff = match &status.recent_wav_handoff {
+            RecentWavHandoff::NoOutcome => "Recent WAV Handoff: No outcome".into(),
+            RecentWavHandoff::Succeeded {
+                outcome: WavHandoffOutcome::TextCommitted,
+            } => "Recent WAV Handoff: Succeeded (text committed)".into(),
+            RecentWavHandoff::Succeeded {
+                outcome: WavHandoffOutcome::NoSpeech,
+            } => "Recent WAV Handoff: Succeeded (no speech)".into(),
+            RecentWavHandoff::Failed { stage, error } => {
+                format!("Recent WAV Handoff: Failed ({stage:?}: {error})")
+            }
+        };
+        let labels = self
+            .status_labels
+            .as_ref()
+            .expect("status window is created before status display");
+        labels.remote.set_label(&remote);
+        labels.profile.set_label(profile);
+        labels.capture.set_label(capture);
+        labels.wav_handoff.set_label(wav_handoff);
+        labels.handoff.set_label(&handoff);
     }
 }

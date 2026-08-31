@@ -316,6 +316,7 @@ fn scripted_atvv_transport_drives_observable_daemon_behavior() {
             OperationalEvent::RemoteReady {
                 at: SystemTime::UNIX_EPOCH,
                 address: "AA:BB:CC:DD:EE:FF".into(),
+                profile: atvv_bridge::AtvvProfile::XIAOMI_V1_HTT_16KHZ_120,
             },
             OperationalEvent::DaemonStopped {
                 at: SystemTime::UNIX_EPOCH,
@@ -418,6 +419,31 @@ fn completed_capture_is_transcribed_committed_and_deleted() {
         } if address == "AA:BB:CC:DD:EE:FF"
     ));
     assert!(!format!("{handoff_event:?}").contains(transcript));
+    let event_position = |matches: fn(&OperationalEvent) -> bool| {
+        boundaries
+            .events
+            .iter()
+            .position(matches)
+            .expect("Capture lifecycle event should be observable")
+    };
+    let capture_started = event_position(|event| {
+        matches!(
+            event,
+            OperationalEvent::CaptureStarted {
+                stream_id: 0x65,
+                ..
+            }
+        )
+    });
+    let capture_stopped =
+        event_position(|event| matches!(event, OperationalEvent::CaptureStopped { .. }));
+    let handoff_started =
+        event_position(|event| matches!(event, OperationalEvent::WavHandoffStarted { .. }));
+    let handoff_succeeded =
+        event_position(|event| matches!(event, OperationalEvent::WavHandoffSucceeded { .. }));
+    assert!(capture_started < capture_stopped);
+    assert!(capture_stopped < handoff_started);
+    assert!(handoff_started < handoff_succeeded);
 }
 
 #[test]

@@ -11,7 +11,11 @@ use thiserror::Error;
 pub mod desktop;
 pub mod system;
 
-pub use desktop::{DesktopApplication, DesktopShell, InProcessVoiceBridge, VoiceBridge};
+pub use desktop::{
+    AtvvProfileReadiness, CaptureStatus, DesktopApplication, DesktopShell, DesktopStatus,
+    InProcessVoiceBridge, LatestDesktopStatus, RecentWavHandoff, RemoteStatus, VoiceBridge,
+    WavHandoffActivity,
+};
 
 pub(crate) const ATVV_SERVICE_UUID: &str = "ab5e0001-5a21-4f05-bc7d-af01f617b664";
 pub(crate) const ATVV_CHARACTERISTIC_UUIDS: [&str; 3] = [
@@ -234,6 +238,7 @@ fn attach_remote_from_snapshot(
 #[derive(Debug, Default)]
 pub struct AttachmentMonitor {
     ready_remote: Option<AttachedIdentity>,
+    pending_attachment: Option<BluezSnapshot>,
     waiting_reported: bool,
 }
 
@@ -292,8 +297,16 @@ impl AttachmentMonitor {
                 return Ok(Some(AtvvEvent::WaitingForRemote));
             }
 
-            let snapshot = gatt.snapshot().map_err(AttachmentError::Inspect)?;
+            let (snapshot, is_pending) = match self.pending_attachment.take() {
+                Some(snapshot) => (snapshot, true),
+                None => (gatt.snapshot().map_err(AttachmentError::Inspect)?, false),
+            };
             let attempted_identity = snapshot.online_remote().map(AttachedIdentity::from);
+            if let (false, Some(remote)) = (is_pending, attempted_identity.as_ref()) {
+                let address = remote.address.clone();
+                self.pending_attachment = Some(snapshot);
+                return Ok(Some(AtvvEvent::RemoteConnected { address }));
+            }
             match attach_remote_from_snapshot(gatt, snapshot) {
                 Err(error) => {
                     let Ok(current_snapshot) = gatt.snapshot() else {
@@ -470,6 +483,9 @@ const MAX_DURATION_SECS: u64 = 3_600;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtvvEvent {
     WaitingForRemote,
+    RemoteConnected {
+        address: String,
+    },
     RemoteReady {
         address: String,
         profile: AtvvProfile,
@@ -522,9 +538,24 @@ pub enum OperationalEvent {
     WaitingForRemote {
         at: SystemTime,
     },
+    RemoteConnected {
+        at: SystemTime,
+        address: String,
+    },
     RemoteReady {
         at: SystemTime,
         address: String,
+        profile: AtvvProfile,
+    },
+    CaptureStarted {
+        at: SystemTime,
+        stream_id: u8,
+    },
+    CaptureStopped {
+        at: SystemTime,
+    },
+    WavHandoffStarted {
+        at: SystemTime,
     },
     CaptureCompleted {
         at: SystemTime,
@@ -853,13 +884,23 @@ where
                     remote_address = None;
                     OperationalEvent::WaitingForRemote { at }
                 }
+                AtvvEvent::RemoteConnected { address } => {
+                    capture = None;
+                    profile = None;
+                    remote_address = Some(address.clone());
+                    OperationalEvent::RemoteConnected { at, address }
+                }
                 AtvvEvent::RemoteReady {
                     address,
                     profile: negotiated_profile,
                 } => {
                     profile = Some(negotiated_profile);
                     remote_address = Some(address.clone());
-                    OperationalEvent::RemoteReady { at, address }
+                    OperationalEvent::RemoteReady {
+                        at,
+                        address,
+                        profile: negotiated_profile,
+                    }
                 }
                 AtvvEvent::ControlNotification(notification) => {
                     let issue = match ControlMessage::parse(&notification.payload) {
@@ -884,6 +925,8 @@ where
                                 audio_bytes: 0,
                                 started_at: notification.received_at,
                             });
+                            self.boundaries
+                                .emit(OperationalEvent::CaptureStarted { at, stream_id });
                             None
                         }
                         ControlMessage::Stop => {
@@ -959,6 +1002,8 @@ where
     }
 
     fn process_completed_capture(&mut self, completed: Capture, at: SystemTime) {
+        self.boundaries
+            .emit(OperationalEvent::CaptureStopped { at });
         let samples = completed.samples.len();
         if samples == 0 {
             return;
@@ -968,6 +1013,8 @@ where
             duration: at.duration_since(completed.started_at).unwrap_or_default(),
             audio_bytes: completed.audio_bytes,
         };
+        self.boundaries
+            .emit(OperationalEvent::WavHandoffStarted { at });
         self.perform_wav_handoff_and_text_commit(
             &metadata,
             completed.profile.sample_rate_hz(),
