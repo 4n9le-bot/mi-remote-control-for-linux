@@ -22,17 +22,6 @@ pub enum ProtocolError {
     InvalidMapping,
 }
 
-impl ProtocolError {
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::InvalidRequest => "invalid_request",
-            Self::UnsupportedProtocol => "unsupported_protocol",
-            Self::UnsupportedCatalog => "unsupported_catalog",
-            Self::InvalidMapping => "invalid_mapping",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StableErrorCode {
