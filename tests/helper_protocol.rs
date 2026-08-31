@@ -83,7 +83,10 @@ fn golden_success_envelopes_cover_every_operation() {
         .unwrap(),
     )
     .unwrap();
-    assert!(inspect.starts_with(r#"{"protocol_version":1,"catalog_version":1,"ok":true,"result":{"kind":"success","operation":"inspect","revision":"r1","mapping":[{"button":"power","target":{"type":"disabled"}}"#));
+    assert_eq!(
+        inspect,
+        r#"{"protocol_version":1,"catalog_version":1,"ok":true,"result":{"kind":"success","operation":"inspect","revision":"r1","mapping":[{"button":"power","target":{"type":"disabled"}},{"button":"confirm","target":{"type":"original"}},{"button":"up","target":{"type":"original"}},{"button":"down","target":{"type":"original"}},{"button":"left","target":{"type":"original"}},{"button":"right","target":{"type":"original"}},{"button":"back","target":{"type":"original"}},{"button":"volume_up","target":{"type":"original"}},{"button":"volume_down","target":{"type":"original"}},{"button":"menu","target":{"type":"original"}},{"button":"live","target":{"type":"original"}}]}}"#
+    );
     assert_eq!(
         String::from_utf8(encode_response(&Response::apply_success("r2")).unwrap()).unwrap(),
         r#"{"protocol_version":1,"catalog_version":1,"ok":true,"result":{"kind":"success","operation":"apply","revision":"r2","mapping":null}}"#
