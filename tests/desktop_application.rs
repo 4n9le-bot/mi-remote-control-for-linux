@@ -8,7 +8,7 @@ use atvv_bridge::{
     ActionableFailureKind, AtvvProfile, AtvvProfileReadiness, BatteryStatus, CaptureStatus,
     ConfigRecoveryDebounce, DesktopApplication, DesktopShell, DesktopStatus, InProcessVoiceBridge,
     IntegrationStage, OperationalEvent, RecentWavHandoff, RecoveryStatus, RemoteStatus,
-    StartupError, VoiceBridge, WavHandoffActivity,
+    StartupError, StatusWindowChrome, VoiceBridge, WavHandoffActivity,
 };
 
 #[derive(Default)]
@@ -33,6 +33,7 @@ impl VoiceBridge for FakeBridge {
 #[derive(Default)]
 struct FakeDesktopShell {
     windows_created: usize,
+    window_chrome: Option<StatusWindowChrome>,
     windows_presented: usize,
     windows_hidden: usize,
     close_confirmations: usize,
@@ -42,8 +43,9 @@ struct FakeDesktopShell {
 }
 
 impl DesktopShell for FakeDesktopShell {
-    fn create_status_window(&mut self) {
+    fn create_status_window(&mut self, chrome: StatusWindowChrome) {
         self.windows_created += 1;
+        self.window_chrome = Some(chrome);
     }
 
     fn present_status_window(&mut self) {
@@ -117,6 +119,18 @@ fn repeated_activation_reuses_the_bridge_and_status_window() {
     assert_eq!(application.bridge().starts, 1);
     assert_eq!(shell.windows_created, 1);
     assert_eq!(shell.windows_presented, 2);
+}
+
+#[test]
+fn status_window_exposes_a_visible_close_action() {
+    let mut application = DesktopApplication::new(FakeBridge::default());
+    let mut shell = FakeDesktopShell::default();
+
+    application
+        .activate(&mut shell)
+        .expect("desktop activation should create the status window");
+
+    assert_eq!(shell.window_chrome, Some(StatusWindowChrome::CloseAction));
 }
 
 #[test]

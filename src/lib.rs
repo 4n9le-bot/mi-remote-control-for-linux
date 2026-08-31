@@ -14,8 +14,8 @@ pub mod system;
 pub use desktop::{
     ActionableFailure, ActionableFailureKind, AtvvProfileReadiness, BatteryStatus, CaptureStatus,
     ConfigRecoveryDebounce, DesktopApplication, DesktopShell, DesktopStatus, InProcessVoiceBridge,
-    LatestDesktopStatus, RecentWavHandoff, RecoveryStatus, RemoteStatus, VoiceBridge,
-    WavHandoffActivity,
+    LatestDesktopStatus, RecentWavHandoff, RecoveryStatus, RemoteStatus, StatusWindowChrome,
+    VoiceBridge, WavHandoffActivity,
 };
 
 pub(crate) const ATVV_SERVICE_UUID: &str = "ab5e0001-5a21-4f05-bc7d-af01f617b664";
