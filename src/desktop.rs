@@ -417,13 +417,8 @@ pub trait VoiceBridge {
 }
 
 /// The desktop operations the application needs, independent of GTK widgets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusWindowChrome {
-    CloseAction,
-}
-
 pub trait DesktopShell {
-    fn create_status_window(&mut self, chrome: StatusWindowChrome);
+    fn create_status_window_with_close_action(&mut self);
     fn present_status_window(&mut self);
     fn display_status(&mut self, status: &DesktopStatus);
     fn tray_available(&self) -> bool;
@@ -453,7 +448,7 @@ where
         if !self.started {
             self.bridge.start()?;
             self.started = true;
-            shell.create_status_window(StatusWindowChrome::CloseAction);
+            shell.create_status_window_with_close_action();
         }
         shell.present_status_window();
         Ok(())

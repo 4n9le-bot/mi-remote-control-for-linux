@@ -8,7 +8,7 @@ use atvv_bridge::{
     ActionableFailureKind, AtvvProfile, AtvvProfileReadiness, BatteryStatus, CaptureStatus,
     ConfigRecoveryDebounce, DesktopApplication, DesktopShell, DesktopStatus, InProcessVoiceBridge,
     IntegrationStage, OperationalEvent, RecentWavHandoff, RecoveryStatus, RemoteStatus,
-    StartupError, StatusWindowChrome, VoiceBridge, WavHandoffActivity,
+    StartupError, VoiceBridge, WavHandoffActivity,
 };
 
 #[derive(Default)]
@@ -33,7 +33,7 @@ impl VoiceBridge for FakeBridge {
 #[derive(Default)]
 struct FakeDesktopShell {
     windows_created: usize,
-    window_chrome: Option<StatusWindowChrome>,
+    close_action_requested: bool,
     windows_presented: usize,
     windows_hidden: usize,
     close_confirmations: usize,
@@ -43,9 +43,9 @@ struct FakeDesktopShell {
 }
 
 impl DesktopShell for FakeDesktopShell {
-    fn create_status_window(&mut self, chrome: StatusWindowChrome) {
+    fn create_status_window_with_close_action(&mut self) {
         self.windows_created += 1;
-        self.window_chrome = Some(chrome);
+        self.close_action_requested = true;
     }
 
     fn present_status_window(&mut self) {
@@ -130,7 +130,7 @@ fn status_window_exposes_a_visible_close_action() {
         .activate(&mut shell)
         .expect("desktop activation should create the status window");
 
-    assert_eq!(shell.window_chrome, Some(StatusWindowChrome::CloseAction));
+    assert!(shell.close_action_requested);
 }
 
 #[test]

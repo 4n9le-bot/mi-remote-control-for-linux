@@ -15,7 +15,7 @@ use atvv_bridge::ConfigSelection;
 use atvv_bridge::{
     AtvvProfileReadiness, BatteryStatus, CaptureStatus, DesktopApplication, DesktopShell,
     DesktopStatus, InProcessVoiceBridge, RecentWavHandoff, RecoveryStatus, RemoteStatus,
-    StatusWindowChrome, WavHandoffActivity, WavHandoffOutcome,
+    WavHandoffActivity, WavHandoffOutcome,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -199,7 +199,7 @@ impl ksni::Tray for StatusTray {
 }
 
 impl DesktopShell for GtkDesktopShell {
-    fn create_status_window(&mut self, chrome: StatusWindowChrome) {
+    fn create_status_window_with_close_action(&mut self) {
         let application = self
             .application
             .as_ref()
@@ -241,12 +241,10 @@ impl DesktopShell for GtkDesktopShell {
             .child(&status_labels.diagnostics)
             .build();
         statuses.append(&diagnostics);
-        let header_bar = match chrome {
-            StatusWindowChrome::CloseAction => adw::HeaderBar::builder()
-                .show_start_title_buttons(true)
-                .show_end_title_buttons(true)
-                .build(),
-        };
+        let header_bar = adw::HeaderBar::builder()
+            .show_start_title_buttons(true)
+            .show_end_title_buttons(true)
+            .build();
         let window_content = adw::ToolbarView::new();
         window_content.add_top_bar(&header_bar);
         window_content.set_content(Some(&statuses));
