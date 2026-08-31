@@ -72,6 +72,7 @@ fn operational_events_publish_complete_status_snapshots() {
             },
             recovery: RecoveryStatus::Idle,
             battery: BatteryStatus::Unknown,
+            actionable_failure: None,
         })
     );
 }

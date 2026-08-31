@@ -127,6 +127,7 @@ struct GtkDesktopShell {
 
 #[cfg(feature = "desktop")]
 struct StatusLabels {
+    actionable_failure: gtk::Label,
     remote: gtk::Label,
     profile: gtk::Label,
     capture: gtk::Label,
@@ -134,6 +135,7 @@ struct StatusLabels {
     handoff: gtk::Label,
     recovery: gtk::Label,
     battery: gtk::Label,
+    diagnostics: gtk::Label,
 }
 
 #[cfg(feature = "desktop")]
@@ -164,6 +166,7 @@ impl DesktopShell for GtkDesktopShell {
                 .build()
         };
         let status_labels = StatusLabels {
+            actionable_failure: status_label(""),
             remote: status_label(""),
             profile: status_label(""),
             capture: status_label(""),
@@ -171,7 +174,9 @@ impl DesktopShell for GtkDesktopShell {
             handoff: status_label(""),
             recovery: status_label(""),
             battery: status_label(""),
+            diagnostics: status_label(""),
         };
+        statuses.append(&status_labels.actionable_failure);
         statuses.append(&status_labels.remote);
         statuses.append(&status_labels.profile);
         statuses.append(&status_labels.capture);
@@ -179,6 +184,11 @@ impl DesktopShell for GtkDesktopShell {
         statuses.append(&status_labels.handoff);
         statuses.append(&status_labels.recovery);
         statuses.append(&status_labels.battery);
+        let diagnostics = gtk::Expander::builder()
+            .label("Diagnostics")
+            .child(&status_labels.diagnostics)
+            .build();
+        statuses.append(&diagnostics);
         self.window = Some(
             adw::ApplicationWindow::builder()
                 .application(application)
@@ -201,10 +211,8 @@ impl DesktopShell for GtkDesktopShell {
 
     fn display_status(&mut self, status: &DesktopStatus) {
         let remote = match &status.remote {
-            RemoteStatus::Waiting => "ATVV Remote: Waiting".into(),
-            RemoteStatus::Connected { address } => {
-                format!("ATVV Remote: Connected ({address})")
-            }
+            RemoteStatus::Waiting => "ATVV Remote: Waiting",
+            RemoteStatus::Connected { .. } => "ATVV Remote: Connected",
         };
         let profile = match status.profile {
             AtvvProfileReadiness::Waiting => "ATVV Profile: Waiting",
@@ -227,17 +235,16 @@ impl DesktopShell for GtkDesktopShell {
             RecentWavHandoff::Succeeded {
                 outcome: WavHandoffOutcome::NoSpeech,
             } => "Recent WAV Handoff: Succeeded (no speech)".into(),
-            RecentWavHandoff::Failed { stage, error } => {
-                format!("Recent WAV Handoff: Failed ({stage:?}: {error})")
+            RecentWavHandoff::Failed { stage, .. } => {
+                format!("Recent WAV Handoff: Failed ({stage:?})")
             }
         };
         let recovery = match &status.recovery {
             RecoveryStatus::Idle => "Recovery: Idle".into(),
             RecoveryStatus::Retrying {
-                next_attempt_at,
-                failure,
+                next_attempt_at, ..
             } => format!(
-                "Recovery: Next attempt at Unix ms {} ({failure})",
+                "Recovery: Next attempt at Unix ms {}",
                 next_attempt_at
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -248,16 +255,38 @@ impl DesktopShell for GtkDesktopShell {
             BatteryStatus::Unknown => "Battery: Unknown".into(),
             BatteryStatus::Percentage(percentage) => format!("Battery: {}%", percentage.get()),
         };
+        let actionable_failure = status
+            .actionable_failure
+            .as_ref()
+            .map(|failure| format!("Bridge Status: {}. {}", failure.summary, failure.action))
+            .unwrap_or_else(|| "Bridge Status: Operational".into());
+        let mut diagnostics = Vec::new();
+        if let Some(failure) = &status.actionable_failure {
+            diagnostics.push(failure.diagnostics.clone());
+        }
+        if let RecoveryStatus::Retrying { failure, .. } = &status.recovery {
+            diagnostics.push(format!("ATVV Remote recovery: {failure}"));
+        }
+        if let RecentWavHandoff::Failed { stage, error } = &status.recent_wav_handoff {
+            diagnostics.push(format!("WAV Handoff {stage:?}: {error}"));
+        }
+        let diagnostics = if diagnostics.is_empty() {
+            "No diagnostics available.".into()
+        } else {
+            diagnostics.join("\n")
+        };
         let labels = self
             .status_labels
             .as_ref()
             .expect("status window is created before status display");
-        labels.remote.set_label(&remote);
+        labels.actionable_failure.set_label(&actionable_failure);
+        labels.remote.set_label(remote);
         labels.profile.set_label(profile);
         labels.capture.set_label(capture);
         labels.wav_handoff.set_label(wav_handoff);
         labels.handoff.set_label(&handoff);
         labels.recovery.set_label(&recovery);
         labels.battery.set_label(&battery);
+        labels.diagnostics.set_label(&diagnostics);
     }
 }

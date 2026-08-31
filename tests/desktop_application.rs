@@ -5,9 +5,10 @@ use std::{
 };
 
 use atvv_bridge::{
-    AtvvProfile, AtvvProfileReadiness, BatteryStatus, CaptureStatus, DesktopApplication,
-    DesktopShell, DesktopStatus, IntegrationStage, OperationalEvent, RecentWavHandoff,
-    RecoveryStatus, RemoteStatus, VoiceBridge, WavHandoffActivity,
+    ActionableFailureKind, AtvvProfile, AtvvProfileReadiness, BatteryStatus, CaptureStatus,
+    ConfigRecoveryDebounce, DesktopApplication, DesktopShell, DesktopStatus, InProcessVoiceBridge,
+    IntegrationStage, OperationalEvent, RecentWavHandoff, RecoveryStatus, RemoteStatus,
+    StartupError, VoiceBridge, WavHandoffActivity,
 };
 
 #[derive(Default)]
@@ -99,6 +100,119 @@ fn repeated_activation_reuses_the_bridge_and_status_window() {
 }
 
 #[test]
+fn local_configuration_failure_is_actionable_without_hiding_the_desktop() {
+    let error =
+        StartupError::MissingExplicitConfig("/home/test/.config/atvv-bridge/config.toml".into());
+    let failure = DesktopStatus::from_startup_error(&error);
+    let bridge = FakeBridge {
+        statuses: VecDeque::from([failure.clone()]),
+        ..FakeBridge::default()
+    };
+    let mut application = DesktopApplication::new(bridge);
+    let mut shell = FakeDesktopShell::default();
+
+    application
+        .activate(&mut shell)
+        .expect("local failures should not prevent desktop activation");
+    application.refresh_status(&mut shell);
+
+    assert_eq!(shell.windows_created, 1);
+    assert_eq!(shell.windows_presented, 1);
+    assert_eq!(shell.statuses.as_slice(), std::slice::from_ref(&failure));
+    let actionable = failure
+        .actionable_failure
+        .expect("the local failure should be actionable");
+    assert_eq!(actionable.kind, ActionableFailureKind::Configuration);
+    assert_eq!(actionable.summary, "Configuration needs attention");
+    assert!(actionable.diagnostics.contains("config.toml"));
+}
+
+#[test]
+fn production_bridge_keeps_the_window_available_when_configuration_is_missing() {
+    let config_directory = tempfile::tempdir().expect("a temporary config directory should exist");
+    let bridge = InProcessVoiceBridge::new(atvv_bridge::ConfigSelection::Explicit(
+        config_directory.path().join("missing.toml"),
+    ));
+    let mut application = DesktopApplication::new(bridge);
+    let mut shell = FakeDesktopShell::default();
+
+    application
+        .activate(&mut shell)
+        .expect("a local configuration failure should stay inside Bridge Status");
+
+    assert_eq!(shell.windows_created, 1);
+    assert_eq!(shell.windows_presented, 1);
+}
+
+#[test]
+fn local_storage_failure_has_a_concise_summary_and_detailed_diagnostics() {
+    let error = StartupError::PrepareWavDir {
+        path: "/tmp/atvv-bridge/capture-secret.wav".into(),
+        source: io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "controlled storage failure",
+        ),
+    };
+
+    let status = DesktopStatus::from_startup_error(&error);
+    let actionable = status.actionable_failure.unwrap();
+
+    assert_eq!(actionable.kind, ActionableFailureKind::LocalStorage);
+    assert_eq!(actionable.summary, "Local storage is unavailable");
+    assert!(!actionable.summary.contains("/tmp/"));
+    assert!(actionable.diagnostics.contains("capture-secret.wav"));
+}
+
+#[test]
+fn wav_storage_failure_is_an_actionable_local_failure() {
+    let status = DesktopStatus::default().transitioned_by(&OperationalEvent::WavHandoffFailed {
+        at: SystemTime::UNIX_EPOCH,
+        address: "AA:BB:CC:DD:EE:FF".into(),
+        duration: Duration::from_secs(1),
+        audio_bytes: 120,
+        stage: IntegrationStage::WavCreation,
+        error: "could not create /tmp/atvv-bridge/capture-secret.wav".into(),
+        retained_wav: None,
+    });
+
+    let actionable = status.actionable_failure.unwrap();
+    assert_eq!(actionable.kind, ActionableFailureKind::LocalStorage);
+    assert_eq!(actionable.summary, "Local storage is unavailable");
+    assert!(!actionable.summary.contains("/tmp/"));
+    assert!(actionable.diagnostics.contains("capture-secret.wav"));
+}
+
+#[test]
+fn configuration_events_are_debounced_for_three_hundred_milliseconds() {
+    let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let mut debounce = ConfigRecoveryDebounce::default();
+
+    debounce.record_event(started_at);
+    debounce.record_event(started_at + Duration::from_millis(200));
+
+    assert!(!debounce.take_retry_due(started_at + Duration::from_millis(499)));
+    assert!(debounce.take_retry_due(started_at + Duration::from_millis(500)));
+    assert!(!debounce.take_retry_due(started_at + Duration::from_secs(1)));
+}
+
+#[test]
+fn valid_reinitialization_clears_the_actionable_local_failure() {
+    let failed = DesktopStatus::from_startup_error(&StartupError::MissingExplicitConfig(
+        "/home/test/.config/atvv-bridge/config.toml".into(),
+    ));
+    assert!(failed.actionable_failure.is_some());
+
+    let recovered = failed.transitioned_by(&OperationalEvent::DaemonStarted {
+        at: SystemTime::UNIX_EPOCH,
+        max_duration_secs: 60,
+        wav_dir: "/tmp/atvv-bridge".into(),
+        keep_wav: false,
+    });
+
+    assert_eq!(recovered, DesktopStatus::default());
+}
+
+#[test]
 fn failed_wav_handoff_is_history_and_does_not_make_the_remote_unready() {
     let at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
     let status = DesktopStatus::default()
@@ -138,6 +252,7 @@ fn failed_wav_handoff_is_history_and_does_not_make_the_remote_unready() {
             },
             recovery: RecoveryStatus::Idle,
             battery: BatteryStatus::Unknown,
+            actionable_failure: None,
         }
     );
 }

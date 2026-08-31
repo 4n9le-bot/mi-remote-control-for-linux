@@ -11,6 +11,7 @@ async-channel = "2"
 async-io = "2"
 clap = { version = "4.5", features = ["derive"] }
 futures-lite = "2"
+notify = "8"
 serde = { version = "1", features = ["derive"] }
 signal-hook = "0.3"
 thiserror = "2"

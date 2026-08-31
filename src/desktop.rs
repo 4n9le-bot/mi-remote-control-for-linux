@@ -1,9 +1,154 @@
-use std::{io, sync::mpsc, thread};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::{Duration, SystemTime},
+};
+
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::{
     Application, BatteryPercentage, ConfigSelection, IntegrationStage, OperationalEvent,
     StartupError, WavHandoffOutcome, system::SystemBoundaries,
 };
+
+const CONFIG_RECOVERY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionableFailureKind {
+    Configuration,
+    LocalStorage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionableFailure {
+    pub kind: ActionableFailureKind,
+    pub summary: String,
+    pub action: String,
+    pub diagnostics: String,
+}
+
+#[derive(Debug, Default)]
+pub struct ConfigRecoveryDebounce {
+    retry_at: Option<std::time::SystemTime>,
+}
+
+impl ConfigRecoveryDebounce {
+    pub fn record_event(&mut self, at: std::time::SystemTime) {
+        self.retry_at = at.checked_add(CONFIG_RECOVERY_DEBOUNCE);
+    }
+
+    pub fn take_retry_due(&mut self, now: std::time::SystemTime) -> bool {
+        if self.retry_at.is_some_and(|retry_at| now >= retry_at) {
+            self.retry_at = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remaining(&self, now: SystemTime) -> Option<Duration> {
+        self.retry_at
+            .map(|retry_at| retry_at.duration_since(now).unwrap_or(Duration::ZERO))
+    }
+}
+
+struct ConfigDirectoryWatcher {
+    _watcher: RecommendedWatcher,
+    events: mpsc::Receiver<notify::Result<notify::Event>>,
+    config_path: PathBuf,
+    config_directory: PathBuf,
+}
+
+impl ConfigDirectoryWatcher {
+    fn new(selection: &ConfigSelection) -> io::Result<Option<Self>> {
+        let config_path = match selection {
+            ConfigSelection::DefaultPath(path) | ConfigSelection::Explicit(path) => path.clone(),
+            ConfigSelection::DefaultsOnly => return Ok(None),
+        };
+        let config_directory = config_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let config_directory = if config_directory.is_absolute() {
+            config_directory
+        } else {
+            std::env::current_dir()?.join(config_directory)
+        };
+        let config_path = if config_path.is_absolute() {
+            config_path
+        } else {
+            std::env::current_dir()?.join(config_path)
+        };
+        let watch_root = nearest_existing_directory(&config_directory)?;
+        let (sender, events) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .map_err(io::Error::other)?;
+        watcher
+            .watch(&watch_root, RecursiveMode::Recursive)
+            .map_err(io::Error::other)?;
+        Ok(Some(Self {
+            _watcher: watcher,
+            events,
+            config_path,
+            config_directory,
+        }))
+    }
+
+    fn wait_for_debounced_change(&self) -> io::Result<()> {
+        let mut debounce = ConfigRecoveryDebounce::default();
+        loop {
+            let event = self
+                .events
+                .recv()
+                .map_err(|_| io::Error::other("configuration directory watcher stopped"))?
+                .map_err(io::Error::other)?;
+            if !self.is_relevant(&event) {
+                continue;
+            }
+            debounce.record_event(SystemTime::now());
+            loop {
+                let remaining = debounce
+                    .remaining(SystemTime::now())
+                    .expect("a configuration event set the retry deadline");
+                match self.events.recv_timeout(remaining) {
+                    Ok(Ok(event)) if self.is_relevant(&event) => {
+                        debounce.record_event(SystemTime::now());
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => return Err(io::Error::other(error)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if debounce.take_retry_due(SystemTime::now()) {
+                            return Ok(());
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(io::Error::other("configuration directory watcher stopped"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_relevant(&self, event: &notify::Event) -> bool {
+        event.paths.iter().any(|path| {
+            path == &self.config_path
+                || path == &self.config_directory
+                || path.parent() == Some(self.config_directory.as_path())
+        })
+    }
+}
+
+fn nearest_existing_directory(path: &Path) -> io::Result<PathBuf> {
+    path.ancestors()
+        .find(|candidate| candidate.is_dir())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| io::Error::other("configuration directory has no existing ancestor"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteStatus {
@@ -66,6 +211,7 @@ pub struct DesktopStatus {
     pub recent_wav_handoff: RecentWavHandoff,
     pub recovery: RecoveryStatus,
     pub battery: BatteryStatus,
+    pub actionable_failure: Option<ActionableFailure>,
 }
 
 impl Default for DesktopStatus {
@@ -78,11 +224,60 @@ impl Default for DesktopStatus {
             recent_wav_handoff: RecentWavHandoff::NoOutcome,
             recovery: RecoveryStatus::Idle,
             battery: BatteryStatus::Unknown,
+            actionable_failure: None,
         }
     }
 }
 
 impl DesktopStatus {
+    fn local_storage_failure(diagnostics: impl Into<String>) -> ActionableFailure {
+        ActionableFailure {
+            kind: ActionableFailureKind::LocalStorage,
+            summary: "Local storage is unavailable".into(),
+            action: "Check the WAV directory; the next Capture will retry.".into(),
+            diagnostics: diagnostics.into(),
+        }
+    }
+
+    pub fn from_startup_error(error: &StartupError) -> Self {
+        let (kind, summary, action) = match error {
+            StartupError::ReadConfig { .. }
+            | StartupError::MissingExplicitConfig(_)
+            | StartupError::ParseConfig { .. }
+            | StartupError::InvalidMaxDuration(_) => (
+                ActionableFailureKind::Configuration,
+                "Configuration needs attention",
+                "Save a valid replacement configuration to retry.",
+            ),
+            StartupError::PrepareWavDir { .. } => (
+                ActionableFailureKind::LocalStorage,
+                "Local storage is unavailable",
+                "Check the WAV directory, then save the configuration to retry.",
+            ),
+        };
+        Self {
+            actionable_failure: Some(ActionableFailure {
+                kind,
+                summary: summary.into(),
+                action: action.into(),
+                diagnostics: error.to_string(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    fn from_config_watcher_error(error: &io::Error) -> Self {
+        Self {
+            actionable_failure: Some(ActionableFailure {
+                kind: ActionableFailureKind::Configuration,
+                summary: "Configuration recovery is unavailable".into(),
+                action: "Restart the application after correcting the configuration.".into(),
+                diagnostics: format!("could not watch the configuration directory: {error}"),
+            }),
+            ..Self::default()
+        }
+    }
+
     pub fn transitioned_by(mut self, event: &OperationalEvent) -> Self {
         match event {
             OperationalEvent::DaemonStarted { .. } => self = Self::default(),
@@ -143,11 +338,24 @@ impl DesktopStatus {
                     stage: *stage,
                     error: error.clone(),
                 };
+                if matches!(
+                    stage,
+                    IntegrationStage::WavCreation | IntegrationStage::WavCleanup
+                ) {
+                    self.actionable_failure = Some(Self::local_storage_failure(error));
+                }
             }
             OperationalEvent::WavHandoffSucceeded { outcome, .. } => {
                 self.capture = CaptureStatus::Idle;
                 self.wav_handoff = WavHandoffActivity::Idle;
                 self.recent_wav_handoff = RecentWavHandoff::Succeeded { outcome: *outcome };
+                if self
+                    .actionable_failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == ActionableFailureKind::LocalStorage)
+                {
+                    self.actionable_failure = None;
+                }
             }
             OperationalEvent::AtvvRemoteRetryScheduled {
                 next_attempt_at,
@@ -273,26 +481,13 @@ impl VoiceBridge for InProcessVoiceBridge {
         let selection = self.selection.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::AlreadyExists, "ATVV Voice Bridge started")
         })?;
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
         let latest_status = self.latest_status.clone();
         thread::Builder::new()
             .name("atvv-voice-bridge".into())
             .spawn(move || {
-                let mut boundaries = SystemBoundaries::with_status_updates(latest_status);
-                let result = Application::start(selection, &mut boundaries);
-                match result {
-                    Ok(application) => {
-                        let _ = started_tx.send(Ok(()));
-                        let _ = application.run();
-                    }
-                    Err(error) => {
-                        let _ = started_tx.send(Err(startup_error_to_io(error)));
-                    }
-                }
+                run_with_config_recovery(selection, latest_status);
             })?;
-        started_rx
-            .recv()
-            .map_err(|_| io::Error::other("ATVV Voice Bridge stopped during startup"))?
+        Ok(())
     }
 
     fn take_latest_status(&mut self) -> Option<DesktopStatus> {
@@ -300,6 +495,30 @@ impl VoiceBridge for InProcessVoiceBridge {
     }
 }
 
-fn startup_error_to_io(error: StartupError) -> io::Error {
-    io::Error::other(error)
+fn run_with_config_recovery(selection: ConfigSelection, latest_status: LatestDesktopStatus) {
+    let watcher = match ConfigDirectoryWatcher::new(&selection) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            latest_status.publish(DesktopStatus::from_config_watcher_error(&error));
+            return;
+        }
+    };
+    loop {
+        let mut boundaries = SystemBoundaries::with_status_updates(latest_status.clone());
+        match Application::start(selection.clone(), &mut boundaries) {
+            Ok(application) => {
+                let _ = application.run();
+                return;
+            }
+            Err(error) => latest_status.publish(DesktopStatus::from_startup_error(&error)),
+        }
+
+        let Some(watcher) = watcher.as_ref() else {
+            return;
+        };
+        if let Err(error) = watcher.wait_for_debounced_change() {
+            latest_status.publish(DesktopStatus::from_config_watcher_error(&error));
+            return;
+        }
+    }
 }
