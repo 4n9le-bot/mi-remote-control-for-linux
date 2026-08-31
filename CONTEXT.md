@@ -27,3 +27,31 @@ _Avoid_: Transcription, paste
 **Bridge Status**:
 The current read-only operational snapshot of the ATVV Voice Bridge, including ATVV Remote connection, Capture, battery, recovery, and actionable-failure state.
 _Avoid_: Log stream, daemon state
+
+**Physical Button**:
+A non-voice control exposed by the certified ATVV Remote through its Bluetooth HID input device, including power, confirm, direction, back, volume, menu, and live controls.
+_Avoid_: Voice button, logical action
+
+**Logical Key**:
+A standard Linux input key code emitted for a Physical Button and interpreted by the desktop or focused application.
+_Avoid_: Command, application action
+
+**Button Mapping**:
+An explicit system-wide override from a Physical Button to either a Logical Key or Disabled. Unconfigured Physical Buttons retain their existing Linux input behavior.
+_Avoid_: Shortcut, command binding
+
+**Installed Mapping**:
+The complete Button Mapping durably stored in the managed hwdb source. It may not govern input until the ATVV Remote reconnects.
+_Avoid_: Current Mapping, Applied Mapping
+
+**Draft Mapping**:
+The complete editable Button Mapping held by the graphical interface but not yet installed.
+_Avoid_: Pending Mapping, unsaved settings
+
+**Mapping Revision**:
+An opaque identity for an Installed Mapping used to detect concurrent changes.
+_Avoid_: File timestamp, version number
+
+**Disabled**:
+A Button Mapping result that suppresses input from one Physical Button. It is distinct from leaving the Physical Button unconfigured.
+_Avoid_: Unconfigured, no mapping
