@@ -1,0 +1,12 @@
+#!/bin/sh
+
+set -e
+
+case "$1" in
+    remove|purge)
+        rm -f -- "${DPKG_ROOT:-}/etc/udev/hwdb.d/99-atvv-bridge-button-mapping.hwdb"
+        systemd-hwdb "--root=${DPKG_ROOT:-/}" --strict update
+        ;;
+esac
+
+exit 0

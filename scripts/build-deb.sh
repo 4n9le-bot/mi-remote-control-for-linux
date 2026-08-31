@@ -60,10 +60,12 @@ shlib_output=$(
         -e"debian/$package_name/usr/bin/atvv-bridge" \
         -e"debian/$package_name/usr/libexec/atvv-bridge/atvv-button-mapping-helper"
 )
-dependencies=${shlib_output#shlibs:Depends=}
+dependencies="${shlib_output#shlibs:Depends=}, pkexec, udev"
 installed_size=$(du -sk "$package_root" | cut -f1)
 
 mkdir -p "$package_root/DEBIAN"
+install -m755 "$repo_dir/packaging/postinst" "$package_root/DEBIAN/postinst"
+install -m755 "$repo_dir/packaging/postrm" "$package_root/DEBIAN/postrm"
 cat >"$package_root/DEBIAN/control" <<EOF
 Package: $package_name
 Version: $package_version

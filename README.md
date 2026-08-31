@@ -23,7 +23,7 @@ dependencies because their installation and configuration are desktop-specific.
 Install Rust 1.85 or newer and the Debian build tools:
 
 ```sh
-sudo apt install cargo dpkg-dev fakeroot jq systemd
+sudo apt install bubblewrap cargo dpkg-dev jq systemd
 ```
 
 Run the package integration test, then build the package:
@@ -41,9 +41,9 @@ scripts/build-deb.sh /tmp/atvv-packages
 ```
 
 The build uses the locked Cargo dependency versions and the architecture
-reported by `dpkg`. The package test verifies its desktop and autostart entries,
-runtime dependencies, hardware database entry, installation, and removal
-behavior.
+reported by `dpkg`. The package test uses Bubblewrap for an unprivileged root
+namespace and verifies desktop and autostart entries, runtime dependencies,
+hardware database compilation, upgrades, and removal behavior.
 
 To build only the release binary:
 
@@ -69,11 +69,12 @@ input running and the tray menu provides **Show Status** and **Quit** actions.
 Without a tray, closing the window explains that voice input will stop and asks
 for confirmation.
 
-The package also installs a hardware database entry for the supported remote.
-It maps only the voice button's repeating F5 scan code to `KEY_RESERVED`, while
-leaving the other remote buttons unchanged. Disconnect and reconnect the remote
-after installing or removing the package so the mapping is applied to the new
-input device.
+The package also installs and compiles a hardware database entry for the
+supported remote. Voice and Power default to Disabled; every other certified
+Physical Button retains its native behavior. Button Mapping overrides survive
+package upgrades. Disconnect and reconnect the remote after changing a mapping,
+installing, or removing the package so the input device uses the compiled
+mapping.
 
 ## Configure
 
@@ -122,4 +123,6 @@ sudo apt remove atvv-bridge
 ```
 
 Package removal preserves user configuration and retained WAV files. Reconnect
-the remote after removal to restore its original voice-button key mapping.
+the remote after removal to restore native button behavior. Removal and purge
+delete only the Button Mapping override managed by ATVV Voice Bridge; unrelated
+hwdb files are preserved.
