@@ -23,3 +23,7 @@ _Avoid_: WAV output, live input
 **Text Commit**:
 Insertion of a successful Voxtype transcript into the application currently focused through Fcitx 5.
 _Avoid_: Transcription, paste
+
+**Bridge Status**:
+The current read-only operational snapshot of the ATVV Voice Bridge, including ATVV Remote connection, Capture, battery, recovery, and actionable-failure state.
+_Avoid_: Log stream, daemon state
