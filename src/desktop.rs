@@ -450,6 +450,11 @@ pub enum ButtonMappingState {
         draft: Mapping,
         revision: String,
     },
+    Validation {
+        installed: Mapping,
+        draft: Mapping,
+        revision: String,
+    },
     RecoveryRequired,
     Unavailable,
 }
@@ -457,6 +462,8 @@ pub enum ButtonMappingState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ButtonMappingPresentation {
     pub state: ButtonMappingState,
+    pub installed: Option<Mapping>,
+    pub draft: Option<Mapping>,
     pub dirty: bool,
     pub can_apply: bool,
     pub can_reset: bool,
@@ -529,19 +536,39 @@ impl<B: ButtonMappingBackend> ButtonMappingController<B> {
             ButtonMappingState::Ready {
                 installed, draft, ..
             } => (installed != draft, installed != draft),
-            ButtonMappingState::Conflict { .. } => (true, false),
+            ButtonMappingState::Conflict { .. } | ButtonMappingState::Validation { .. } => {
+                (true, false)
+            }
             _ => (false, false),
+        };
+        let (installed, draft) = match &self.state {
+            ButtonMappingState::Ready {
+                installed, draft, ..
+            }
+            | ButtonMappingState::Conflict {
+                installed, draft, ..
+            }
+            | ButtonMappingState::Validation {
+                installed, draft, ..
+            } => (Some(installed.clone()), Some(draft.clone())),
+            _ => (
+                self.pending_installed.clone(),
+                self.pending_mapping
+                    .clone()
+                    .or_else(|| self.preserved_draft.clone()),
+            ),
         };
         ButtonMappingPresentation {
             state: self.state.clone(),
+            installed,
+            draft,
             dirty,
             can_apply,
-            can_reset: !matches!(
+            can_reset: matches!(
                 self.state,
-                ButtonMappingState::Inspecting
-                    | ButtonMappingState::Applying
-                    | ButtonMappingState::Resetting
-                    | ButtonMappingState::Unavailable
+                ButtonMappingState::Ready { .. }
+                    | ButtonMappingState::Validation { .. }
+                    | ButtonMappingState::RecoveryRequired
             ),
             notice: self.notice.clone(),
         }
@@ -564,11 +591,20 @@ impl<B: ButtonMappingBackend> ButtonMappingController<B> {
             {
                 self.backend.start(BackendOperation::Inspect).ok()?;
                 self.state = ButtonMappingState::Inspecting;
-                Some(ButtonMappingEffect::Render)
+                Some(if matches!(event, ButtonMappingEvent::Open) {
+                    ButtonMappingEffect::Open
+                } else {
+                    ButtonMappingEffect::Render
+                })
             }
-            ButtonMappingEvent::Open => Some(ButtonMappingEffect::Render),
+            ButtonMappingEvent::Open => Some(ButtonMappingEffect::Open),
             ButtonMappingEvent::Edit(id, target) => {
                 if let ButtonMappingState::Ready {
+                    installed,
+                    mut draft,
+                    revision,
+                }
+                | ButtonMappingState::Validation {
                     installed,
                     mut draft,
                     revision,
@@ -616,11 +652,12 @@ impl<B: ButtonMappingBackend> ButtonMappingController<B> {
                 }
             }
             ButtonMappingEvent::Reset => {
-                if matches!(self.state, ButtonMappingState::RecoveryRequired) {
-                    self.backend.start(BackendOperation::Reset).ok()?;
-                    self.state = ButtonMappingState::Resetting;
-                    Some(ButtonMappingEffect::AuthorizationRequired)
-                } else if matches!(self.state, ButtonMappingState::Ready { .. }) {
+                if matches!(
+                    self.state,
+                    ButtonMappingState::Ready { .. }
+                        | ButtonMappingState::Validation { .. }
+                        | ButtonMappingState::RecoveryRequired
+                ) {
                     self.reset_confirmation = true;
                     Some(ButtonMappingEffect::ConfirmReset)
                 } else {
@@ -630,6 +667,11 @@ impl<B: ButtonMappingBackend> ButtonMappingController<B> {
             ButtonMappingEvent::ConfirmReset if self.reset_confirmation => {
                 self.reset_confirmation = false;
                 if let ButtonMappingState::Ready {
+                    installed,
+                    draft,
+                    revision,
+                }
+                | ButtonMappingState::Validation {
                     installed,
                     draft,
                     revision,
@@ -727,6 +769,23 @@ impl<B: ButtonMappingBackend> ButtonMappingController<B> {
     }
     fn handle_code(&mut self, code: StableErrorCode) {
         match code {
+            StableErrorCode::InvalidMapping => {
+                if let (Some(installed), Some(draft), Some(revision)) = (
+                    self.pending_installed.take(),
+                    self.pending_mapping.take(),
+                    self.pending_revision.take(),
+                ) {
+                    self.notice = Some(
+                        "The staged mapping was rejected. Choose a valid logical key and try again."
+                            .into(),
+                    );
+                    self.state = ButtonMappingState::Validation {
+                        installed,
+                        draft,
+                        revision,
+                    };
+                }
+            }
             StableErrorCode::RevisionConflict => {
                 if let ButtonMappingState::Applying = self.state {
                     let installed = self
