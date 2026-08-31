@@ -71,6 +71,7 @@ fn main() {
             }
         }
         desktop.refresh_status(&mut *shell);
+        desktop.refresh_button_mapping(&mut *shell);
         gtk::glib::ControlFlow::Continue
     });
     application.run_with_args(&["atvv-bridge"]);

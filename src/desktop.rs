@@ -12,6 +12,11 @@ use crate::{
     Application, BatteryPercentage, ConfigSelection, IntegrationStage, OperationalEvent,
     StartupError, WavHandoffOutcome, system::SystemBoundaries,
 };
+use crate::{
+    button_mapping::{ButtonId, Mapping, MappingTarget},
+    button_mapping_backend::{BackendFailure, BackendOperation, ButtonMappingBackend},
+    helper_protocol::{DecodedResponse, StableErrorCode},
+};
 
 const CONFIG_RECOVERY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -425,21 +430,403 @@ pub trait DesktopShell {
     fn hide_status_window(&mut self);
     fn confirm_close_quits_bridge(&mut self);
     fn quit(&mut self);
+    fn render_button_mapping(&mut self, _presentation: &ButtonMappingPresentation) {}
+    fn perform_button_mapping_effect(&mut self, _effect: ButtonMappingEffect) {}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ButtonMappingState {
+    Unloaded,
+    Inspecting,
+    Ready {
+        installed: Mapping,
+        draft: Mapping,
+        revision: String,
+    },
+    Applying,
+    Resetting,
+    Conflict {
+        installed: Mapping,
+        draft: Mapping,
+        revision: String,
+    },
+    RecoveryRequired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ButtonMappingPresentation {
+    pub state: ButtonMappingState,
+    pub dirty: bool,
+    pub can_apply: bool,
+    pub can_reset: bool,
+    pub notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonMappingEffect {
+    Open,
+    Render,
+    AuthorizationRequired,
+    ConfirmReset,
+    ConfirmReload,
+    Hide,
+    ConfirmQuit,
+    Quit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ButtonMappingEvent {
+    Open,
+    Edit(ButtonId, MappingTarget),
+    Apply,
+    Reset,
+    ConfirmReset,
+    Cancel,
+    Reload,
+    ConfirmReload,
+    Retry,
+    AuthorizationCancelled,
+}
+
+pub struct ButtonMappingController<B> {
+    backend: B,
+    state: ButtonMappingState,
+    notice: Option<String>,
+    reset_confirmation: bool,
+    reload_confirmation: bool,
+    pending_mapping: Option<Mapping>,
+    pending_installed: Option<Mapping>,
+    pending_revision: Option<String>,
+    preserved_draft: Option<Mapping>,
+}
+
+impl<B: ButtonMappingBackend> ButtonMappingController<B> {
+    pub fn new(backend: B) -> Self {
+        Self {
+            backend,
+            state: ButtonMappingState::Unloaded,
+            notice: None,
+            reset_confirmation: false,
+            reload_confirmation: false,
+            pending_mapping: None,
+            pending_installed: None,
+            pending_revision: None,
+            preserved_draft: None,
+        }
+    }
+    pub fn state(&self) -> &ButtonMappingState {
+        &self.state
+    }
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+    pub fn presentation(&self) -> ButtonMappingPresentation {
+        let (dirty, can_apply) = match &self.state {
+            ButtonMappingState::Ready {
+                installed, draft, ..
+            } => (installed != draft, installed != draft),
+            ButtonMappingState::Conflict { .. } => (true, false),
+            _ => (false, false),
+        };
+        ButtonMappingPresentation {
+            state: self.state.clone(),
+            dirty,
+            can_apply,
+            can_reset: !matches!(
+                self.state,
+                ButtonMappingState::Inspecting
+                    | ButtonMappingState::Applying
+                    | ButtonMappingState::Resetting
+                    | ButtonMappingState::Unavailable
+            ),
+            notice: self.notice.clone(),
+        }
+    }
+    pub fn dispatch(&mut self, event: ButtonMappingEvent) -> Option<ButtonMappingEffect> {
+        self.notice = None;
+        if matches!(
+            self.state,
+            ButtonMappingState::Applying | ButtonMappingState::Resetting
+        ) && !matches!(event, ButtonMappingEvent::AuthorizationCancelled)
+        {
+            return None;
+        }
+        match event {
+            ButtonMappingEvent::Open | ButtonMappingEvent::Retry
+                if matches!(
+                    self.state,
+                    ButtonMappingState::Unloaded | ButtonMappingState::Unavailable
+                ) =>
+            {
+                self.backend.start(BackendOperation::Inspect).ok()?;
+                self.state = ButtonMappingState::Inspecting;
+                Some(ButtonMappingEffect::Render)
+            }
+            ButtonMappingEvent::Open => Some(ButtonMappingEffect::Render),
+            ButtonMappingEvent::Edit(id, target) => {
+                if let ButtonMappingState::Ready {
+                    installed,
+                    mut draft,
+                    revision,
+                } = self.state.clone()
+                {
+                    draft = Mapping::from_entries(
+                        draft
+                            .iter()
+                            .map(|(b, t)| (b, if b == id { target } else { t })),
+                    )
+                    .ok()?;
+                    self.state = ButtonMappingState::Ready {
+                        installed,
+                        draft,
+                        revision,
+                    };
+                    Some(ButtonMappingEffect::Render)
+                } else {
+                    None
+                }
+            }
+            ButtonMappingEvent::Apply => {
+                if let ButtonMappingState::Ready {
+                    installed,
+                    draft,
+                    revision,
+                } = &self.state
+                {
+                    if installed == draft {
+                        return None;
+                    }
+                    self.pending_mapping = Some(draft.clone());
+                    self.pending_installed = Some(installed.clone());
+                    self.pending_revision = Some(revision.clone());
+                    self.backend
+                        .start(BackendOperation::Apply {
+                            expected_revision: revision.clone(),
+                            mapping: draft.clone(),
+                        })
+                        .ok()?;
+                    self.state = ButtonMappingState::Applying;
+                    Some(ButtonMappingEffect::AuthorizationRequired)
+                } else {
+                    None
+                }
+            }
+            ButtonMappingEvent::Reset => {
+                if matches!(self.state, ButtonMappingState::RecoveryRequired) {
+                    self.backend.start(BackendOperation::Reset).ok()?;
+                    self.state = ButtonMappingState::Resetting;
+                    Some(ButtonMappingEffect::AuthorizationRequired)
+                } else if matches!(self.state, ButtonMappingState::Ready { .. }) {
+                    self.reset_confirmation = true;
+                    Some(ButtonMappingEffect::ConfirmReset)
+                } else {
+                    None
+                }
+            }
+            ButtonMappingEvent::ConfirmReset if self.reset_confirmation => {
+                self.reset_confirmation = false;
+                if let ButtonMappingState::Ready {
+                    installed,
+                    draft,
+                    revision,
+                } = &self.state
+                {
+                    self.pending_installed = Some(installed.clone());
+                    self.pending_mapping = Some(draft.clone());
+                    self.pending_revision = Some(revision.clone());
+                }
+                self.backend.start(BackendOperation::Reset).ok()?;
+                self.state = ButtonMappingState::Resetting;
+                Some(ButtonMappingEffect::AuthorizationRequired)
+            }
+            ButtonMappingEvent::Reload
+                if matches!(self.state, ButtonMappingState::Conflict { .. }) =>
+            {
+                self.reload_confirmation = true;
+                Some(ButtonMappingEffect::ConfirmReload)
+            }
+            ButtonMappingEvent::ConfirmReload if self.reload_confirmation => {
+                self.reload_confirmation = false;
+                self.backend.start(BackendOperation::Inspect).ok()?;
+                self.state = ButtonMappingState::Inspecting;
+                Some(ButtonMappingEffect::Render)
+            }
+            ButtonMappingEvent::AuthorizationCancelled => {
+                self.restore_pending_or_unavailable();
+                self.notice =
+                    Some("Authorization was cancelled; staged edits were preserved.".into());
+                Some(ButtonMappingEffect::Render)
+            }
+            ButtonMappingEvent::Cancel => {
+                self.reset_confirmation = false;
+                self.reload_confirmation = false;
+                self.notice = Some("Operation cancelled; staged edits were preserved.".into());
+                Some(ButtonMappingEffect::Render)
+            }
+            _ => None,
+        }
+    }
+    pub fn poll(&mut self) -> bool {
+        let Some(result) = self.backend.try_take_result() else {
+            return false;
+        };
+        match result {
+            Ok(DecodedResponse::Inspect { revision, mapping }) => {
+                let draft = self
+                    .preserved_draft
+                    .take()
+                    .unwrap_or_else(|| mapping.clone());
+                self.state = ButtonMappingState::Ready {
+                    installed: mapping,
+                    draft,
+                    revision,
+                };
+            }
+            Ok(DecodedResponse::Apply { revision }) => {
+                if let ButtonMappingState::Applying = self.state {
+                    let mapping = self
+                        .pending_mapping
+                        .take()
+                        .unwrap_or_else(Mapping::defaults);
+                    self.pending_installed = None;
+                    self.pending_revision = None;
+                    self.notice = Some(format!(
+                        "Mapping written (revision {revision}); reconnect the remote to activate it."
+                    ));
+                    self.state = ButtonMappingState::Ready {
+                        installed: mapping.clone(),
+                        draft: mapping,
+                        revision,
+                    };
+                }
+            }
+            Ok(DecodedResponse::Reset { revision }) => {
+                self.pending_mapping = None;
+                self.pending_installed = None;
+                self.notice = Some(format!(
+                    "Defaults restored (revision {revision}); reconnect the remote to activate them."
+                ));
+                let mapping = Mapping::defaults();
+                self.state = ButtonMappingState::Ready {
+                    installed: mapping.clone(),
+                    draft: mapping,
+                    revision,
+                };
+            }
+            Ok(DecodedResponse::RecoveryRequired) => {
+                self.state = ButtonMappingState::RecoveryRequired
+            }
+            Ok(DecodedResponse::Error(code)) => self.handle_code(code),
+            Err(error) => self.handle_failure(error),
+        }
+        true
+    }
+    fn handle_code(&mut self, code: StableErrorCode) {
+        match code {
+            StableErrorCode::RevisionConflict => {
+                if let ButtonMappingState::Applying = self.state {
+                    let installed = self
+                        .pending_installed
+                        .take()
+                        .unwrap_or_else(Mapping::defaults);
+                    let draft = self
+                        .pending_mapping
+                        .take()
+                        .unwrap_or_else(Mapping::defaults);
+                    self.pending_revision = None;
+                    self.state = ButtonMappingState::Conflict {
+                        installed,
+                        draft,
+                        revision: String::new(),
+                    };
+                }
+            }
+            StableErrorCode::InconsistentState | StableErrorCode::RollbackFailed => {
+                self.preserved_draft = self.pending_mapping.take();
+                self.pending_installed = None;
+                self.pending_revision = None;
+                self.state = ButtonMappingState::RecoveryRequired
+            }
+            StableErrorCode::UnsupportedSystem | StableErrorCode::UnsupportedCatalog => {
+                self.state = ButtonMappingState::Unavailable
+            }
+            _ => {
+                self.notice = Some(format!(
+                    "Button Mapping operation failed: {}",
+                    code.as_str()
+                ));
+                self.restore_pending_or_unavailable();
+            }
+        }
+    }
+    fn handle_failure(&mut self, error: BackendFailure) {
+        self.notice = Some(match error {
+            BackendFailure::AuthorizationNotGranted => {
+                "Authorization was cancelled; staged edits were preserved.".into()
+            }
+            BackendFailure::AuthorizationUnavailable => "Authorization is unavailable.".into(),
+            _ => "Button Mapping operation failed; staged edits were preserved.".into(),
+        });
+        if matches!(self.state, ButtonMappingState::Inspecting) {
+            self.state = ButtonMappingState::Unavailable;
+        } else if matches!(
+            self.state,
+            ButtonMappingState::Applying | ButtonMappingState::Resetting
+        ) {
+            self.restore_pending_or_unavailable();
+        }
+    }
+
+    fn restore_pending_or_unavailable(&mut self) {
+        if let (Some(installed), Some(draft), Some(revision)) = (
+            self.pending_installed.take(),
+            self.pending_mapping.take(),
+            self.pending_revision.take(),
+        ) {
+            self.preserved_draft = Some(draft.clone());
+            self.state = ButtonMappingState::Ready {
+                installed,
+                draft,
+                revision,
+            };
+        } else {
+            self.state = ButtonMappingState::Unavailable;
+        }
+    }
 }
 
 /// A single desktop application that owns one ATVV Voice Bridge and status window.
-pub struct DesktopApplication<B> {
+pub struct DesktopApplication<B, M = crate::button_mapping_backend::ProcessButtonMappingBackend> {
     bridge: B,
+    button_mapping: ButtonMappingController<M>,
     started: bool,
 }
 
-impl<B> DesktopApplication<B>
+impl<B> DesktopApplication<B, crate::button_mapping_backend::ProcessButtonMappingBackend>
 where
     B: VoiceBridge,
 {
     pub fn new(bridge: B) -> Self {
+        Self::new_with_button_mapping(
+            bridge,
+            crate::button_mapping_backend::ProcessButtonMappingBackend::new(),
+        )
+    }
+}
+
+impl<B, M> DesktopApplication<B, M>
+where
+    B: VoiceBridge,
+    M: ButtonMappingBackend,
+{
+    pub fn new_with_button_mapping(bridge: B, button_mapping_backend: M) -> Self {
         Self {
             bridge,
+            button_mapping: ButtonMappingController::new(button_mapping_backend),
             started: false,
         }
     }
@@ -458,6 +845,27 @@ where
         &self.bridge
     }
 
+    pub fn button_mapping(&self) -> &ButtonMappingController<M> {
+        &self.button_mapping
+    }
+
+    pub fn button_mapping_event(
+        &mut self,
+        event: ButtonMappingEvent,
+        shell: &mut impl DesktopShell,
+    ) {
+        if let Some(effect) = self.button_mapping.dispatch(event) {
+            shell.perform_button_mapping_effect(effect);
+        }
+        shell.render_button_mapping(&self.button_mapping.presentation());
+    }
+
+    pub fn refresh_button_mapping(&mut self, shell: &mut impl DesktopShell) {
+        if self.button_mapping.poll() {
+            shell.render_button_mapping(&self.button_mapping.presentation());
+        }
+    }
+
     pub fn refresh_status(&mut self, shell: &mut impl DesktopShell) {
         if let Some(status) = self.bridge.take_latest_status() {
             shell.display_status(&status);
@@ -465,16 +873,31 @@ where
     }
 
     pub fn close_requested(&mut self, shell: &mut impl DesktopShell) {
+        if matches!(
+            self.button_mapping.state(),
+            ButtonMappingState::Applying | ButtonMappingState::Resetting
+        ) {
+            shell.perform_button_mapping_effect(ButtonMappingEffect::Render);
+            return;
+        }
         if shell.tray_available() {
             shell.hide_status_window();
+            shell.perform_button_mapping_effect(ButtonMappingEffect::Hide);
         } else {
             shell.confirm_close_quits_bridge();
+            shell.perform_button_mapping_effect(ButtonMappingEffect::ConfirmQuit);
         }
     }
 
     pub fn close_confirmed(&mut self, confirmed: bool, shell: &mut impl DesktopShell) {
-        if confirmed {
+        if confirmed
+            && !matches!(
+                self.button_mapping.state(),
+                ButtonMappingState::Applying | ButtonMappingState::Resetting
+            )
+        {
             shell.quit();
+            shell.perform_button_mapping_effect(ButtonMappingEffect::Quit);
         }
     }
 
