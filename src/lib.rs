@@ -8,7 +8,10 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
+pub mod desktop;
 pub mod system;
+
+pub use desktop::{DesktopApplication, DesktopShell, InProcessVoiceBridge, VoiceBridge};
 
 pub(crate) const ATVV_SERVICE_UUID: &str = "ab5e0001-5a21-4f05-bc7d-af01f617b664";
 pub(crate) const ATVV_CHARACTERISTIC_UUIDS: [&str; 3] = [

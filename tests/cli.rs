@@ -1,6 +1,8 @@
+use std::process::Command;
+#[cfg(not(feature = "desktop"))]
 use std::{
     fs,
-    process::{Command, Stdio},
+    process::Stdio,
     thread,
     time::{Duration, Instant},
 };
@@ -20,6 +22,7 @@ fn version_flag_reports_the_executable_version() {
 }
 
 #[test]
+#[cfg(not(feature = "desktop"))]
 fn explicit_invalid_configuration_fails_with_an_actionable_error() {
     let temp = tempfile::tempdir().expect("temporary directory should be created");
     let config = temp.path().join("config.toml");
@@ -37,6 +40,7 @@ fn explicit_invalid_configuration_fails_with_an_actionable_error() {
 }
 
 #[test]
+#[cfg(not(feature = "desktop"))]
 fn xdg_standard_configuration_is_selected_by_public_startup() {
     let temp = tempfile::tempdir().expect("temporary directory should be created");
     let config_dir = temp.path().join("atvv-bridge");
@@ -58,6 +62,7 @@ fn xdg_standard_configuration_is_selected_by_public_startup() {
 }
 
 #[test]
+#[cfg(not(feature = "desktop"))]
 fn normal_startup_enters_the_daemon_run_loop() {
     let temp = tempfile::tempdir().expect("temporary directory should be created");
     let config = temp.path().join("config.toml");
