@@ -241,12 +241,19 @@ impl DesktopShell for GtkDesktopShell {
             .child(&status_labels.diagnostics)
             .build();
         statuses.append(&diagnostics);
+        let header_bar = adw::HeaderBar::builder()
+            .show_start_title_buttons(true)
+            .show_end_title_buttons(true)
+            .build();
+        let window_content = adw::ToolbarView::new();
+        window_content.add_top_bar(&header_bar);
+        window_content.set_content(Some(&statuses));
         let window = adw::ApplicationWindow::builder()
             .application(application)
             .title("ATVV Voice Bridge")
             .default_width(360)
             .default_height(220)
-            .content(&statuses)
+            .content(&window_content)
             .build();
         let event_sender = self.event_sender.clone();
         window.connect_close_request(move |_| {

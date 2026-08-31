@@ -120,7 +120,7 @@ fn repeated_activation_reuses_the_bridge_and_status_window() {
 }
 
 #[test]
-fn close_request_hides_the_window_when_a_tray_is_available() {
+fn visible_close_action_hides_the_window_when_a_tray_is_available() {
     let mut application = DesktopApplication::new(FakeBridge::default());
     let mut shell = FakeDesktopShell {
         tray_available: true,
@@ -135,7 +135,7 @@ fn close_request_hides_the_window_when_a_tray_is_available() {
 }
 
 #[test]
-fn close_request_without_a_tray_requires_confirmation() {
+fn visible_close_action_without_a_tray_requires_confirmation() {
     let mut application = DesktopApplication::new(FakeBridge::default());
     let mut shell = FakeDesktopShell::default();
 
