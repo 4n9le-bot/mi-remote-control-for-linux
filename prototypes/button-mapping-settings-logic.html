@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Button Mapping Settings — Logic Prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f4f7;
+      --panel: #ffffff;
+      --ink: #202124;
+      --muted: #68707d;
+      --line: #dfe2e8;
+      --accent: #3567d6;
+      --accent-soft: #e9efff;
+      --good: #237a43;
+      --good-soft: #e9f7ee;
+      --warn: #9a5b00;
+      --warn-soft: #fff4d6;
+      --bad: #ad2e2e;
+      --bad-soft: #fdeaea;
+      --shadow: 0 12px 32px rgba(40, 48, 64, 0.10);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); }
+    button, select, input { font: inherit; }
+    button { cursor: pointer; }
+    button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
+    .page { width: min(1180px, calc(100% - 32px)); margin: 34px auto 80px; }
+    .intro { margin-bottom: 24px; }
+    .eyebrow { color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; }
+    h1 { margin: 7px 0 10px; font-size: clamp(28px, 4vw, 42px); line-height: 1.05; }
+    .question { max-width: 850px; color: var(--muted); font-size: 16px; line-height: 1.55; }
+    .throwaway { display: inline-block; margin-top: 8px; color: var(--warn); font-size: 13px; font-weight: 700; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(300px, .9fr); gap: 20px; align-items: start; }
+    .window, .state-card, .lab { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow); }
+    .window-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+    .window-title { font-size: 17px; font-weight: 750; }
+    .status-pills { display: flex; gap: 7px; flex-wrap: wrap; justify-content: end; }
+    .pill { border-radius: 999px; padding: 4px 9px; background: #eef0f4; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .pill.connected { background: var(--good-soft); color: var(--good); }
+    .pill.offline { background: var(--warn-soft); color: var(--warn); }
+    .banner { margin: 16px 18px 0; border-radius: 12px; padding: 12px 14px; font-size: 14px; line-height: 1.4; }
+    .banner.info { background: var(--accent-soft); color: #244f9f; }
+    .banner.success { background: var(--good-soft); color: var(--good); }
+    .banner.warning { background: var(--warn-soft); color: #795000; }
+    .banner.error { background: var(--bad-soft); color: var(--bad); }
+    .settings { padding: 12px 18px 4px; }
+    .group { margin: 14px 0 22px; }
+    .group-title { margin: 0 0 8px; color: var(--muted); font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .rows { border: 1px solid var(--line); border-radius: 13px; overflow: hidden; }
+    .mapping-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(130px, .9fr) minmax(210px, 1.25fr); gap: 12px; align-items: center; padding: 11px 12px; border-bottom: 1px solid var(--line); }
+    .mapping-row:last-child { border-bottom: 0; }
+    .button-name { font-weight: 720; }
+    .scan { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .native { color: var(--muted); font-size: 13px; }
+    .mapping-control { display: flex; gap: 7px; align-items: center; }
+    .mapping-control select { width: 100%; min-width: 0; border: 1px solid #cbd0da; border-radius: 9px; background: white; padding: 8px 9px; }
+    .icon-button { border: 1px solid #cbd0da; border-radius: 9px; background: white; padding: 8px 10px; white-space: nowrap; }
+    .power-warning { grid-column: 1 / -1; color: var(--bad); font-size: 12px; line-height: 1.35; }
+    .window-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 18px 18px; }
+    .footer-actions { display: flex; gap: 8px; }
+    .button { border: 1px solid #c7ccd6; border-radius: 10px; background: white; padding: 9px 14px; font-weight: 700; }
+    .button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    .button.danger { border-color: #ddabab; color: var(--bad); }
+    .dirty-label { color: var(--muted); font-size: 12px; }
+    .state-card { position: sticky; top: 18px; overflow: hidden; }
+    .state-card h2, .lab h2 { margin: 0; font-size: 17px; }
+    .state-head { padding: 17px 18px; border-bottom: 1px solid var(--line); }
+    .state-body { padding: 14px 18px 18px; }
+    .state-grid { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; font-size: 13px; }
+    .state-grid dt { color: var(--muted); }
+    .state-grid dd { margin: 0; text-align: right; font-weight: 700; }
+    .state-section { margin-top: 16px; }
+    .state-section h3 { margin: 0 0 7px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
+    .change-list, .override-list { margin: 0; padding-left: 18px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.55; }
+    .empty { color: var(--muted); font-size: 12px; font-style: italic; }
+    .lab { margin-top: 22px; padding: 20px; }
+    .lab-intro { color: var(--muted); font-size: 14px; line-height: 1.45; }
+    .free-play { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 22px; }
+    .free-play button, .scenario-step { border: 1px solid #c9ced8; border-radius: 9px; background: white; padding: 8px 11px; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 7px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+    .tab { border: 0; border-radius: 8px; background: transparent; padding: 7px 10px; color: var(--muted); font-weight: 700; }
+    .tab.active { background: var(--accent-soft); color: var(--accent); }
+    .scenario { padding-top: 16px; }
+    .scenario h3 { margin: 0 0 5px; }
+    .scenario p { margin: 0 0 13px; color: var(--muted); line-height: 1.45; }
+    .scenario-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+    .scenario-step.current { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 750; }
+    .scenario-step.done { color: var(--good); border-color: #a9d7b7; }
+    .arrow { color: #a2a7b0; }
+    .operation-sheet { margin: 0 18px 16px; border: 1px solid #cbd5ee; border-radius: 13px; background: #f7f9ff; padding: 14px; }
+    .operation-sheet h3 { margin: 0 0 5px; font-size: 15px; }
+    .operation-sheet p { margin: 0 0 11px; color: var(--muted); font-size: 13px; line-height: 1.4; }
+    .operation-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+    dialog { width: min(560px, calc(100% - 30px)); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); padding: 0; }
+    dialog::backdrop { background: rgba(25, 30, 40, .42); }
+    .dialog-head { padding: 17px 18px 10px; }
+    .dialog-head h2 { margin: 0 0 5px; font-size: 18px; }
+    .dialog-head p { margin: 0; color: var(--muted); font-size: 13px; }
+    .key-search { width: calc(100% - 36px); margin: 10px 18px; border: 1px solid #cbd0da; border-radius: 9px; padding: 10px; }
+    .key-results { max-height: 300px; overflow: auto; padding: 0 18px 14px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+    .key-result { text-align: left; border: 1px solid #d5d9e1; border-radius: 8px; background: white; padding: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .dialog-foot { display: flex; justify-content: end; padding: 12px 18px 16px; border-top: 1px solid var(--line); }
+    @media (max-width: 840px) {
+      .workspace { grid-template-columns: 1fr; }
+      .state-card { position: static; }
+      .mapping-row { grid-template-columns: 1fr; gap: 5px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="intro">
+      <div class="eyebrow">Logic prototype · Catalog v1</div>
+      <h1>Button Mapping settings</h1>
+      <p class="question"><strong>Question:</strong> Can one settings window make installed mappings, staged edits, privileged operations, and recovery states understandable without losing user work—especially when authorization is cancelled, the helper is busy, an administrator changes the mapping externally, the compiled database is damaged, or the remote is offline?</p>
+      <span class="throwaway">Throwaway prototype — not production UI</span>
+    </section>
+
+    <section class="workspace">
+      <article class="window" aria-label="Button Mapping settings prototype">
+        <header class="window-header">
+          <div class="window-title">Button Mapping</div>
+          <div class="status-pills" id="statusPills"></div>
+        </header>
+        <div id="banner"></div>
+        <div class="settings" id="settings"></div>
+        <div id="operationSheet"></div>
+        <footer class="window-footer">
+          <div class="dirty-label" id="dirtyLabel"></div>
+          <div class="footer-actions">
+            <button class="button danger" id="defaultsButton">Reset All</button>
+            <button class="button primary" id="applyButton">Apply</button>
+          </div>
+        </footer>
+      </article>
+
+      <aside class="state-card">
+        <div class="state-head"><h2>Current state</h2></div>
+        <div class="state-body" id="stateBody"></div>
+      </aside>
+    </section>
+
+    <section class="lab">
+      <h2>Interaction lab</h2>
+      <p class="lab-intro">Use free-play controls in any order, or run a guided walkthrough. Every action goes through the same pure state machine and re-renders the full state above.</p>
+      <div class="free-play" id="freePlay"></div>
+      <div class="tabs" id="scenarioTabs"></div>
+      <div class="scenario" id="scenario"></div>
+    </section>
+  </main>
+
+  <dialog id="keyDialog">
+    <div class="dialog-head">
+      <h2>Choose a Logical Key</h2>
+      <p id="keyDialogSubtitle">Search the complete compiled key registry.</p>
+    </div>
+    <input class="key-search" id="keySearch" type="search" placeholder="Search, for example: menu, home, F12">
+    <div class="key-results" id="keyResults"></div>
+    <div class="dialog-foot"><button class="button" id="closeKeyDialog">Cancel</button></div>
+  </dialog>
+
+  <script>
+    const ButtonMappingModel = (() => {
+      const catalog = [
+        { group: "Device", id: "power", name: "Power", scan: "70066", nativeKey: "KEY_POWER", packageDefault: "disabled" },
+        { group: "Navigation", id: "confirm", name: "Confirm", scan: "70028", nativeKey: "KEY_ENTER", packageDefault: "keep" },
+        { group: "Navigation", id: "up", name: "Up", scan: "70052", nativeKey: "KEY_UP", packageDefault: "keep" },
+        { group: "Navigation", id: "down", name: "Down", scan: "70051", nativeKey: "KEY_DOWN", packageDefault: "keep" },
+        { group: "Navigation", id: "left", name: "Left", scan: "70050", nativeKey: "KEY_LEFT", packageDefault: "keep" },
+        { group: "Navigation", id: "right", name: "Right", scan: "7004f", nativeKey: "KEY_RIGHT", packageDefault: "keep" },
+        { group: "Navigation", id: "back", name: "Back", scan: "700f1", nativeKey: "KEY_BACK", packageDefault: "keep" },
+        { group: "Volume", id: "volume_up", name: "Volume Up", scan: "70080", nativeKey: "KEY_VOLUMEUP", packageDefault: "keep" },
+        { group: "Volume", id: "volume_down", name: "Volume Down", scan: "70081", nativeKey: "KEY_VOLUMEDOWN", packageDefault: "keep" },
+        { group: "Special", id: "menu", name: "Menu", scan: "70065", nativeKey: "KEY_COMPOSE", packageDefault: "keep" },
+        { group: "Special", id: "live", name: "Live", scan: "70035", nativeKey: "KEY_GRAVE", packageDefault: "keep" },
+      ];
+
+      const defaults = Object.fromEntries(catalog.map(button => [button.id, button.packageDefault]));
+      const clone = value => JSON.parse(JSON.stringify(value));
+      const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+      const nextRevision = state => `r${state.revisionCounter + 1}`;
+      const result = (state, tone, message, change) => ({ ...state, notice: { tone, message }, lastChange: change });
+      const illegal = (state, message) => result(state, "error", message, "Action rejected by the state model");
+
+      function initialState() {
+        return {
+          catalogVersion: 1,
+          helperCatalogVersion: 1,
+          remote: "connected",
+          platform: "supported",
+          integrity: "ready",
+          stale: false,
+          revisionCounter: 17,
+          installedRevision: "r17",
+          loadedRevision: "r17",
+          installed: clone(defaults),
+          draft: clone(defaults),
+          operation: "idle",
+          notice: { tone: "info", message: "System-wide mappings are ready to edit." },
+          lastChange: "Demo initialized",
+        };
+      }
+
+      function editable(state) {
+        return state.platform === "supported" && state.integrity === "ready" && !state.stale && state.operation === "idle";
+      }
+
+      function reduce(state, action) {
+        switch (action.type) {
+          case "RESET_DEMO":
+            return initialState();
+          case "EDIT": {
+            if (!editable(state)) return illegal(state, "Editing is unavailable in the current state.");
+            if (!catalog.some(button => button.id === action.buttonId)) return illegal(state, "Unknown Physical Button.");
+            const next = clone(state);
+            next.draft[action.buttonId] = action.value;
+            return result(next, "info", "Edit staged locally. Apply is required to write it system-wide.", `${action.buttonId} staged as ${action.value}`);
+          }
+          case "TOGGLE_REMOTE": {
+            const remote = state.remote === "connected" ? "offline" : "connected";
+            return result({ ...state, remote }, remote === "offline" ? "warning" : "info", remote === "offline" ? "Remote offline. Editing and Apply remain available, but activation cannot be observed." : "Remote connected. Saved mappings still require reconnect after Apply.", `Remote is now ${remote}`);
+          }
+          case "REQUEST_APPLY":
+            if (!editable(state)) return illegal(state, "Apply is unavailable in the current state.");
+            if (same(state.draft, state.installed)) return illegal(state, "There are no staged changes to apply.");
+            return result({ ...state, operation: "authorizing-apply" }, "info", "Administrative authorization is required for this Apply only.", "Apply requested");
+          case "REQUEST_DEFAULTS":
+            if (state.platform !== "supported" || state.operation !== "idle") return illegal(state, "Restore Defaults is unavailable in the current state.");
+            if (state.stale) return illegal(state, "Reload the externally changed mapping before restoring defaults.");
+            return result({ ...state, operation: "confirming-defaults" }, "warning", "Restoring defaults removes every custom mapping. Power returns to Disabled.", "Default restoration confirmation opened");
+          case "CONFIRM_DEFAULTS":
+            if (state.operation !== "confirming-defaults") return illegal(state, "No default restoration is awaiting confirmation.");
+            return result({ ...state, operation: "authorizing-defaults" }, "warning", "Administrative authorization is required to restore package defaults.", "Default restoration confirmed");
+          case "CANCEL_OPERATION":
+            if (!["confirming-defaults", "authorizing-apply", "authorizing-defaults"].includes(state.operation)) return illegal(state, "There is no cancellable operation.");
+            return result({ ...state, operation: "idle" }, "warning", "Operation cancelled. Installed mappings and staged edits are unchanged.", "Operation cancelled");
+          case "AUTH_APPROVE":
+            if (state.operation === "authorizing-apply") return result({ ...state, operation: "applying" }, "info", "Authorization granted. The helper is validating and compiling the candidate mapping.", "Apply authorized");
+            if (state.operation === "authorizing-defaults") return result({ ...state, operation: "applying-defaults" }, "info", "Authorization granted. The helper is restoring and verifying package defaults.", "Default restoration authorized");
+            return illegal(state, "No authorization request is active.");
+          case "APPLY_SUCCEEDED": {
+            if (state.operation !== "applying") return illegal(state, "No Apply is in progress.");
+            const revision = nextRevision(state);
+            return result({ ...state, operation: "idle", revisionCounter: state.revisionCounter + 1, installedRevision: revision, loadedRevision: revision, installed: clone(state.draft), stale: false, integrity: "ready" }, "success", "Mapping written successfully. Reconnect the ATVV Remote to activate it.", `Apply completed at ${revision}`);
+          }
+          case "DEFAULTS_SUCCEEDED": {
+            if (state.operation !== "applying-defaults") return illegal(state, "No default restoration is in progress.");
+            const revision = nextRevision(state);
+            return result({ ...state, operation: "idle", revisionCounter: state.revisionCounter + 1, installedRevision: revision, loadedRevision: revision, installed: clone(defaults), draft: clone(defaults), stale: false, integrity: "ready" }, "success", "Package defaults restored. Power is Disabled. Reconnect the ATVV Remote to activate them.", `Defaults restored at ${revision}`);
+          }
+          case "HELPER_BUSY":
+            if (!["applying", "applying-defaults"].includes(state.operation)) return illegal(state, "No privileged operation is in progress.");
+            return result({ ...state, operation: "idle" }, "warning", "Another mapping operation is active. Try again later; staged edits are preserved.", "Helper returned busy");
+          case "HELPER_FAILED":
+            if (!["applying", "applying-defaults"].includes(state.operation)) return illegal(state, "No privileged operation is in progress.");
+            return result({ ...state, operation: "idle" }, "error", "Validation or compilation failed. The previous installed mapping was restored; staged edits are preserved.", "Helper failed and rolled back");
+          case "HELPER_CONFLICT":
+            if (state.operation !== "applying") return illegal(state, "No Apply is in progress.");
+            return result({ ...state, operation: "idle", stale: true }, "error", "The system mapping changed after this window loaded. Reload before editing or applying again.", "Expected revision conflict");
+          case "EXTERNAL_CHANGE": {
+            if (state.operation !== "idle") return illegal(state, "External-change simulation requires an idle operation.");
+            const revision = nextRevision(state);
+            const installed = clone(state.installed);
+            installed.menu = installed.menu === "key:KEY_MENU" ? "keep" : "key:KEY_MENU";
+            return result({ ...state, revisionCounter: state.revisionCounter + 1, installedRevision: revision, installed }, "warning", "An administrator changed the managed system mapping outside this window. The conflict appears on the next Apply.", `External change created ${revision}`);
+          }
+          case "RELOAD_CURRENT":
+            if (!state.stale) return illegal(state, "The loaded revision is not stale.");
+            return result({ ...state, stale: false, loadedRevision: state.installedRevision, draft: clone(state.installed) }, "info", "Current system mapping reloaded. Previous staged edits were discarded after the conflict.", `Reloaded ${state.installedRevision}`);
+          case "DAMAGE_DATABASE":
+            if (state.operation !== "idle") return illegal(state, "Damage simulation requires an idle operation.");
+            return result({ ...state, integrity: "inconsistent", stale: false }, "error", "The managed source and compiled database disagree. Editing is disabled; Restore Defaults is the only recovery.", "Source/database inconsistency detected");
+          case "SET_UNSUPPORTED":
+            if (state.operation !== "idle") return illegal(state, "Platform simulation requires an idle operation.");
+            return result({ ...state, platform: "unsupported" }, "error", "Required systemd-hwdb capabilities are unavailable. Button Mapping is disabled; voice input remains available.", "Platform marked unsupported");
+          case "SET_REGISTRY_MISMATCH":
+            if (state.operation !== "idle") return illegal(state, "Registry simulation requires an idle operation.");
+            return result({ ...state, helperCatalogVersion: 2, platform: "registry-mismatch" }, "error", "The GUI and helper catalogs differ. Restart or reload the application before changing mappings.", "Catalog version mismatch simulated");
+          case "SET_SUPPORTED":
+            return result({ ...state, platform: "supported", helperCatalogVersion: 1 }, "info", "Platform and catalog compatibility restored.", "Support restored");
+          default:
+            return illegal(state, `Unknown action: ${action.type}`);
+        }
+      }
+
+      function generatedOverrides(selections) {
+        const lines = [];
+        for (const button of catalog) {
+          const value = selections[button.id];
+          if (button.id === "power" && value === "keep") lines.push(`${button.scan}=power`);
+          else if (value === "disabled" && button.packageDefault !== "disabled") lines.push(`${button.scan}=reserved`);
+          else if (value.startsWith("key:")) lines.push(`${button.scan}=${value.slice(4).replace(/^KEY_/, "").toLowerCase()}`);
+        }
+        return lines;
+      }
+
+      function view(state) {
+        const dirty = !same(state.draft, state.installed);
+        const changes = catalog.filter(button => state.draft[button.id] !== state.installed[button.id]).map(button => ({ name: button.name, from: state.installed[button.id], to: state.draft[button.id] }));
+        return {
+          ...state,
+          dirty,
+          changes,
+          editable: editable(state),
+          canApply: editable(state) && dirty,
+          canDefaults: state.platform === "supported" && !state.stale && state.operation === "idle",
+          generatedOverrides: generatedOverrides(state.draft),
+        };
+      }
+
+      return { catalog, defaults, initialState, reduce, view };
+    })();
+
+    const LOGICAL_KEYS = [
+      "KEY_BACK", "KEY_BACKSPACE", "KEY_COMPOSE", "KEY_DOWN", "KEY_END", "KEY_ENTER", "KEY_ESC", "KEY_F1", "KEY_F2", "KEY_F3", "KEY_F4", "KEY_F5", "KEY_F6", "KEY_F7", "KEY_F8", "KEY_F9", "KEY_F10", "KEY_F11", "KEY_F12", "KEY_FORWARD", "KEY_GRAVE", "KEY_HOME", "KEY_LEFT", "KEY_MENU", "KEY_MUTE", "KEY_NEXTSONG", "KEY_PAGEDOWN", "KEY_PAGEUP", "KEY_PAUSE", "KEY_PLAYPAUSE", "KEY_POWER", "KEY_PREVIOUSSONG", "KEY_RECORD", "KEY_RIGHT", "KEY_SEARCH", "KEY_STOPCD", "KEY_TAB", "KEY_TV", "KEY_UP", "KEY_VOLUMEDOWN", "KEY_VOLUMEUP"
+    ];
+    const COMMON_KEYS = ["KEY_ENTER", "KEY_ESC", "KEY_HOME", "KEY_MENU", "KEY_PLAYPAUSE", "KEY_TV", "KEY_VOLUMEUP", "KEY_VOLUMEDOWN"];
+
+    let state = ButtonMappingModel.initialState();
+    let activeKeyButton = null;
+    let activeScenario = 0;
+    let scenarioStep = 0;
+
+    const scenarios = [
+      { name: "Happy Apply", description: "Stage a semantic Live mapping, authorize once, and verify that success means Saved—not Active—until reconnect.", steps: [
+        ["Map Live to KEY_TV", { type: "EDIT", buttonId: "live", value: "key:KEY_TV" }], ["Apply", { type: "REQUEST_APPLY" }], ["Authorize", { type: "AUTH_APPROVE" }], ["Helper succeeds", { type: "APPLY_SUCCEEDED" }],
+      ]},
+      { name: "Cancel Auth", description: "Cancel the administrative prompt. Installed state stays unchanged and the staged edit remains available.", steps: [
+        ["Disable Menu", { type: "EDIT", buttonId: "menu", value: "disabled" }], ["Apply", { type: "REQUEST_APPLY" }], ["Cancel authorization", { type: "CANCEL_OPERATION" }],
+      ]},
+      { name: "Busy", description: "The fixed helper lock is already held. The helper returns immediately and preserves the draft.", steps: [
+        ["Map Back to Escape", { type: "EDIT", buttonId: "back", value: "key:KEY_ESC" }], ["Apply", { type: "REQUEST_APPLY" }], ["Authorize", { type: "AUTH_APPROVE" }], ["Helper reports busy", { type: "HELPER_BUSY" }],
+      ]},
+      { name: "External Conflict", description: "An administrator changes the mapping after this window loaded. Apply rejects the stale revision; Reload explicitly discards the old draft.", steps: [
+        ["Stage Live", { type: "EDIT", buttonId: "live", value: "key:KEY_TV" }], ["External change", { type: "EXTERNAL_CHANGE" }], ["Apply", { type: "REQUEST_APPLY" }], ["Authorize", { type: "AUTH_APPROVE" }], ["Conflict", { type: "HELPER_CONFLICT" }], ["Reload current", { type: "RELOAD_CURRENT" }],
+      ]},
+      { name: "Rollback", description: "Strict validation fails after authorization. The installed revision survives and the staged edit remains.", steps: [
+        ["Disable Confirm", { type: "EDIT", buttonId: "confirm", value: "disabled" }], ["Apply", { type: "REQUEST_APPLY" }], ["Authorize", { type: "AUTH_APPROVE" }], ["Validation fails", { type: "HELPER_FAILED" }],
+      ]},
+      { name: "Damaged State", description: "Source and compiled data disagree. Editing stops; explicit Restore Defaults warns that custom mappings will be lost.", steps: [
+        ["Detect damage", { type: "DAMAGE_DATABASE" }], ["Restore Defaults", { type: "REQUEST_DEFAULTS" }], ["Confirm data loss", { type: "CONFIRM_DEFAULTS" }], ["Authorize", { type: "AUTH_APPROVE" }], ["Restore succeeds", { type: "DEFAULTS_SUCCEEDED" }],
+      ]},
+      { name: "Offline", description: "The remote is offline, but the fixed catalog still supports editing and writing. Success never claims activation.", steps: [
+        ["Remote goes offline", { type: "TOGGLE_REMOTE" }], ["Map Menu", { type: "EDIT", buttonId: "menu", value: "key:KEY_MENU" }], ["Apply", { type: "REQUEST_APPLY" }], ["Authorize", { type: "AUTH_APPROVE" }], ["Helper succeeds", { type: "APPLY_SUCCEEDED" }],
+      ]},
+      { name: "Unsupported", description: "Missing systemd-hwdb capabilities disable Button Mapping without disabling the voice bridge.", steps: [
+        ["Detect unsupported system", { type: "SET_UNSUPPORTED" }], ["Try to edit", { type: "EDIT", buttonId: "menu", value: "disabled" }], ["Restore support", { type: "SET_SUPPORTED" }],
+      ]},
+    ];
+
+    function dispatch(action) {
+      state = ButtonMappingModel.reduce(state, action);
+      render();
+    }
+
+    function valueLabel(value, button) {
+      if (value === "keep") return button.id === "power" ? "Keep Original (KEY_POWER)" : "Keep Original";
+      if (value === "disabled") return "Disabled";
+      return value.slice(4);
+    }
+
+    function renderSettings(vm) {
+      const groups = [...new Set(ButtonMappingModel.catalog.map(button => button.group))];
+      document.getElementById("settings").innerHTML = groups.map(group => {
+        const rows = ButtonMappingModel.catalog.filter(button => button.group === group).map(button => {
+          const current = vm.draft[button.id];
+          const options = [
+            ["keep", button.id === "power" ? "Keep Original (KEY_POWER)" : "Keep Original"],
+            ["disabled", "Disabled"],
+            ...COMMON_KEYS.map(key => [`key:${key}`, key]),
+          ];
+          if (current.startsWith("key:") && !options.some(([value]) => value === current)) options.push([current, current.slice(4)]);
+          const powerWarning = button.id === "power" && current === "keep" ? '<div class="power-warning">Warning: native KEY_POWER may suspend or power off this PC. Reset All returns Power to Disabled.</div>' : "";
+          return `<div class="mapping-row">
+            <div><span class="button-name">${button.name}</span><span class="scan">scan ${button.scan}</span></div>
+            <div class="native">Native: ${button.nativeKey}</div>
+            <div class="mapping-control">
+              <select data-button="${button.id}" ${vm.editable ? "" : "disabled"}>${options.map(([value, label]) => `<option value="${value}" ${value === current ? "selected" : ""}>${label}</option>`).join("")}</select>
+              <button class="icon-button key-picker" data-button="${button.id}" ${vm.editable ? "" : "disabled"}>Find key…</button>
+            </div>${powerWarning}
+          </div>`;
+        }).join("");
+        return `<section class="group"><h2 class="group-title">${group}</h2><div class="rows">${rows}</div></section>`;
+      }).join("");
+
+      document.querySelectorAll("select[data-button]").forEach(select => select.addEventListener("change", event => dispatch({ type: "EDIT", buttonId: event.target.dataset.button, value: event.target.value })));
+      document.querySelectorAll(".key-picker").forEach(button => button.addEventListener("click", () => openKeyDialog(button.dataset.button)));
+    }
+
+    function renderOperation(vm) {
+      const host = document.getElementById("operationSheet");
+      const sheets = {
+        "confirming-defaults": ["Restore package defaults?", "All custom mappings will be removed. Power returns to Disabled.", [["Cancel", "CANCEL_OPERATION"], ["Continue", "CONFIRM_DEFAULTS"]]],
+        "authorizing-apply": ["Administrative authorization", "This authorization applies to one system-wide Apply and will not be retained.", [["Cancel", "CANCEL_OPERATION"], ["Authorize", "AUTH_APPROVE"]]],
+        "authorizing-defaults": ["Administrative authorization", "This authorization restores package defaults and removes every custom mapping.", [["Cancel", "CANCEL_OPERATION"], ["Authorize", "AUTH_APPROVE"]]],
+        "applying": ["Helper is applying mappings", "Prototype result controls let you simulate the bounded privileged outcome.", [["Success", "APPLY_SUCCEEDED"], ["Busy", "HELPER_BUSY"], ["Conflict", "HELPER_CONFLICT"], ["Fail + rollback", "HELPER_FAILED"]]],
+        "applying-defaults": ["Helper is restoring defaults", "Prototype result controls let you simulate the recovery outcome.", [["Success", "DEFAULTS_SUCCEEDED"], ["Busy", "HELPER_BUSY"], ["Fail", "HELPER_FAILED"]]],
+      };
+      if (!sheets[vm.operation]) { host.innerHTML = ""; return; }
+      const [title, text, actions] = sheets[vm.operation];
+      host.innerHTML = `<div class="operation-sheet"><h3>${title}</h3><p>${text}</p><div class="operation-actions">${actions.map(([label, type]) => `<button class="button ${label === "Authorize" || label === "Success" ? "primary" : ""}" data-operation="${type}">${label}</button>`).join("")}</div></div>`;
+      host.querySelectorAll("[data-operation]").forEach(button => button.addEventListener("click", () => dispatch({ type: button.dataset.operation })));
+    }
+
+    function renderState(vm) {
+      const changes = vm.changes.length ? `<ul class="change-list">${vm.changes.map(change => `<li>${change.name}: ${change.from} → ${change.to}</li>`).join("")}</ul>` : '<div class="empty">No staged changes</div>';
+      const overrides = vm.generatedOverrides.length ? `<ul class="override-list">${vm.generatedOverrides.map(line => `<li>${line}</li>`).join("")}</ul>` : '<div class="empty">No GUI override entries</div>';
+      document.getElementById("stateBody").innerHTML = `
+        <dl class="state-grid">
+          <dt>Remote</dt><dd>${vm.remote}</dd>
+          <dt>Platform</dt><dd>${vm.platform}</dd>
+          <dt>Integrity</dt><dd>${vm.integrity}</dd>
+          <dt>Operation</dt><dd>${vm.operation}</dd>
+          <dt>Installed revision</dt><dd>${vm.installedRevision}</dd>
+          <dt>Loaded revision</dt><dd>${vm.loadedRevision}</dd>
+          <dt>Catalogs</dt><dd>GUI ${vm.catalogVersion} / helper ${vm.helperCatalogVersion}</dd>
+          <dt>Draft</dt><dd>${vm.dirty ? "staged" : "clean"}</dd>
+          <dt>Stale</dt><dd>${vm.stale ? "yes" : "no"}</dd>
+        </dl>
+        <section class="state-section"><h3>Staged differences</h3>${changes}</section>
+        <section class="state-section"><h3>Generated override</h3>${overrides}</section>
+        <section class="state-section"><h3>Last transition</h3><div class="empty">${vm.lastChange}</div></section>`;
+    }
+
+    function renderFreePlay() {
+      const actions = [
+        ["Toggle remote", { type: "TOGGLE_REMOTE" }], ["External admin change", { type: "EXTERNAL_CHANGE" }], ["Reload current", { type: "RELOAD_CURRENT" }], ["Damage database", { type: "DAMAGE_DATABASE" }], ["Unsupported system", { type: "SET_UNSUPPORTED" }], ["Catalog mismatch", { type: "SET_REGISTRY_MISMATCH" }], ["Restore support", { type: "SET_SUPPORTED" }], ["Reset demo", { type: "RESET_DEMO" }],
+      ];
+      document.getElementById("freePlay").innerHTML = actions.map(([label, action], index) => `<button data-free="${index}">${label}</button>`).join("");
+      document.querySelectorAll("[data-free]").forEach(button => button.addEventListener("click", () => dispatch(actions[Number(button.dataset.free)][1])));
+    }
+
+    function renderScenarios() {
+      document.getElementById("scenarioTabs").innerHTML = scenarios.map((scenario, index) => `<button class="tab ${index === activeScenario ? "active" : ""}" data-tab="${index}">${scenario.name}</button>`).join("");
+      document.querySelectorAll("[data-tab]").forEach(button => button.addEventListener("click", () => {
+        activeScenario = Number(button.dataset.tab);
+        scenarioStep = 0;
+        state = ButtonMappingModel.initialState();
+        render();
+      }));
+      const scenario = scenarios[activeScenario];
+      document.getElementById("scenario").innerHTML = `<h3>${scenario.name}</h3><p>${scenario.description}</p><div class="scenario-steps">${scenario.steps.map(([label], index) => `${index ? '<span class="arrow">→</span>' : ""}<button class="scenario-step ${index === scenarioStep ? "current" : index < scenarioStep ? "done" : ""}" data-step="${index}" ${index !== scenarioStep ? "disabled" : ""}>${label}</button>`).join("")}</div>`;
+      document.querySelectorAll("[data-step]").forEach(button => button.addEventListener("click", () => {
+        const action = scenario.steps[scenarioStep][1];
+        state = ButtonMappingModel.reduce(state, action);
+        scenarioStep += 1;
+        render();
+      }));
+    }
+
+    function openKeyDialog(buttonId) {
+      activeKeyButton = buttonId;
+      const button = ButtonMappingModel.catalog.find(item => item.id === buttonId);
+      document.getElementById("keyDialogSubtitle").textContent = `Choose a Logical Key for ${button.name}.`;
+      document.getElementById("keySearch").value = "";
+      renderKeyResults("");
+      document.getElementById("keyDialog").showModal();
+      document.getElementById("keySearch").focus();
+    }
+
+    function renderKeyResults(query) {
+      const normalized = query.trim().toUpperCase();
+      const keys = LOGICAL_KEYS.filter(key => key.includes(normalized));
+      document.getElementById("keyResults").innerHTML = keys.map(key => `<button class="key-result" data-key="${key}">${key}</button>`).join("") || '<div class="empty">No matching Logical Key</div>';
+      document.querySelectorAll("[data-key]").forEach(button => button.addEventListener("click", () => {
+        dispatch({ type: "EDIT", buttonId: activeKeyButton, value: `key:${button.dataset.key}` });
+        document.getElementById("keyDialog").close();
+      }));
+    }
+
+    function render() {
+      const vm = ButtonMappingModel.view(state);
+      document.getElementById("statusPills").innerHTML = `<span class="pill ${vm.remote}">${vm.remote === "connected" ? "Remote connected" : "Remote offline"}</span><span class="pill">System-wide</span><span class="pill">Catalog v${vm.catalogVersion}</span>`;
+      document.getElementById("banner").innerHTML = `<div class="banner ${vm.notice.tone}">${vm.notice.message}</div>`;
+      renderSettings(vm);
+      renderOperation(vm);
+      renderState(vm);
+      document.getElementById("dirtyLabel").textContent = vm.dirty ? `${vm.changes.length} staged change${vm.changes.length === 1 ? "" : "s"}` : "No staged changes";
+      document.getElementById("applyButton").disabled = !vm.canApply;
+      document.getElementById("defaultsButton").disabled = !vm.canDefaults;
+      document.getElementById("defaultsButton").textContent = vm.integrity === "inconsistent" ? "Restore Defaults" : "Reset All";
+      renderFreePlay();
+      renderScenarios();
+    }
+
+    document.getElementById("applyButton").addEventListener("click", () => dispatch({ type: "REQUEST_APPLY" }));
+    document.getElementById("defaultsButton").addEventListener("click", () => dispatch({ type: "REQUEST_DEFAULTS" }));
+    document.getElementById("keySearch").addEventListener("input", event => renderKeyResults(event.target.value));
+    document.getElementById("closeKeyDialog").addEventListener("click", () => document.getElementById("keyDialog").close());
+    render();
+  </script>
+</body>
+</html>
