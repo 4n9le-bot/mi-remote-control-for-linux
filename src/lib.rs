@@ -401,29 +401,6 @@ pub trait BluezClient {
     fn managed_objects(&mut self) -> io::Result<BluezSnapshot>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NotReady {
-    NoAtvvRemote,
-    Disconnected,
-    ServicesUnresolved,
-    MissingCharacteristics,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Readiness {
-    Ready {
-        address: String,
-    },
-    NotReady {
-        address: Option<String>,
-        reason: NotReady,
-    },
-}
-
-pub fn check_readiness(bluez: &mut impl BluezClient) -> io::Result<Readiness> {
-    Ok(bluez.managed_objects()?.readiness())
-}
-
 impl BluezSnapshot {
     fn atvv_endpoints(&self, device: &Device) -> Option<AtvvEndpoints> {
         self.services
@@ -465,47 +442,6 @@ impl BluezSnapshot {
                 endpoints: self.atvv_endpoints(device)?,
             })
         })
-    }
-
-    fn readiness(&self) -> Readiness {
-        let mut candidates: Vec<_> = self
-            .devices
-            .iter()
-            .filter(|device| {
-                self.services.iter().any(|service| {
-                    service.device_path == device.path
-                        && service.uuid.eq_ignore_ascii_case(ATVV_SERVICE_UUID)
-                })
-            })
-            .collect();
-        candidates.sort_by(|left, right| {
-            right
-                .connected
-                .cmp(&left.connected)
-                .then_with(|| left.address.cmp(&right.address))
-        });
-        let Some(device) = candidates.first() else {
-            return Readiness::NotReady {
-                address: None,
-                reason: NotReady::NoAtvvRemote,
-            };
-        };
-        let not_ready = |reason| Readiness::NotReady {
-            address: Some(device.address.clone()),
-            reason,
-        };
-        if !device.connected {
-            return not_ready(NotReady::Disconnected);
-        }
-        if !device.services_resolved {
-            return not_ready(NotReady::ServicesUnresolved);
-        }
-        if self.atvv_endpoints(device).is_none() {
-            return not_ready(NotReady::MissingCharacteristics);
-        }
-        Readiness::Ready {
-            address: device.address.clone(),
-        }
     }
 }
 

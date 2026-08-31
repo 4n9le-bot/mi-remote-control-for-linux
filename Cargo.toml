@@ -9,7 +9,6 @@ license = "MIT"
 [dependencies]
 async-channel = "2"
 async-io = "2"
-clap = { version = "4.5", features = ["derive"] }
 futures-lite = "2"
 notify = "8"
 serde = { version = "1", features = ["derive"] }
@@ -19,8 +18,14 @@ tempfile = "3"
 toml = "0.9"
 zbus = "=5.9.0"
 gtk = { version = "0.10.3", package = "gtk4", optional = true }
-adw = { version = "0.8", package = "libadwaita", optional = true }
+adw = { version = "0.8", package = "libadwaita", features = ["v1_5"], optional = true }
+ksni = { version = "=0.3.4", default-features = false, features = ["async-io", "blocking"], optional = true }
 
 [features]
 default = ["desktop"]
-desktop = ["dep:adw", "dep:gtk"]
+desktop = ["dep:adw", "dep:gtk", "dep:ksni"]
+
+[[bin]]
+name = "atvv-bridge"
+path = "src/main.rs"
+required-features = ["desktop"]

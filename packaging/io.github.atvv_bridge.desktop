@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ATVV Voice Bridge
+Comment=Use an ATVV Remote for Voxtype voice input
+Exec=atvv-bridge
+Icon=preferences-desktop-peripherals
+Terminal=false
+Categories=Utility;
+StartupNotify=true

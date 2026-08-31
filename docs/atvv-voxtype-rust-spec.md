@@ -71,24 +71,16 @@ WAV方式文件保存到用户指定的新路径； voxtype transcribe recording
 
 PipeWire 虚拟 source，需先验证 voxtype 的设备选择、格式和生命周期要求。
 
-## 5. 运行与部署
+## 5. Runtime and deployment
 
-- 主程序是长驻进程；
-- 通过 systemd --user 管理；
-- ExecStart 直接启动 atvv-bridge；
-- Restart=on-failure；
-- WantedBy=default.target；
-- 配置错误应立即退出并输出明确错误；
-- 不以 root 或系统级 service 运行。
-
-
-建议命令：
-
-```text
-atvv-bridge --config PATH
-atvv-bridge --check
-atvv-bridge --version
-```
+- The GTK4/Libadwaita desktop application owns the long-running bridge.
+- A normal application-menu entry starts it on demand.
+- A system-wide XDG autostart entry starts it with each graphical session.
+- A StatusNotifier tray keeps it discoverable after closing the window where
+  supported; without a tray, closing requires confirmation and quits.
+- Configuration errors remain visible and recover after a valid replacement is
+  saved.
+- The application runs as the desktop user, never as root or a system service.
 
 
 ## 6. 配置

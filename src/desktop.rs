@@ -421,6 +421,10 @@ pub trait DesktopShell {
     fn create_status_window(&mut self);
     fn present_status_window(&mut self);
     fn display_status(&mut self, status: &DesktopStatus);
+    fn tray_available(&self) -> bool;
+    fn hide_status_window(&mut self);
+    fn confirm_close_quits_bridge(&mut self);
+    fn quit(&mut self);
 }
 
 /// A single desktop application that owns one ATVV Voice Bridge and status window.
@@ -458,6 +462,24 @@ where
         if let Some(status) = self.bridge.take_latest_status() {
             shell.display_status(&status);
         }
+    }
+
+    pub fn close_requested(&mut self, shell: &mut impl DesktopShell) {
+        if shell.tray_available() {
+            shell.hide_status_window();
+        } else {
+            shell.confirm_close_quits_bridge();
+        }
+    }
+
+    pub fn close_confirmed(&mut self, confirmed: bool, shell: &mut impl DesktopShell) {
+        if confirmed {
+            shell.quit();
+        }
+    }
+
+    pub fn quit_requested(&mut self, shell: &mut impl DesktopShell) {
+        shell.quit();
     }
 }
 

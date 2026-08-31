@@ -19,10 +19,14 @@ test -n "$package"
 contents=$(dpkg-deb --contents "$package")
 grep -Eq '[[:space:]]\./usr/bin/atvv-bridge$' <<<"$contents"
 grep -Eq '[[:space:]]\./usr/lib/udev/hwdb.d/90-atvv-bridge.hwdb$' <<<"$contents"
-grep -Eq '[[:space:]]\./usr/lib/systemd/user/atvv-bridge.service$' <<<"$contents"
+grep -Eq '[[:space:]]\./usr/share/applications/io.github.atvv_bridge.desktop$' <<<"$contents"
+grep -Eq '[[:space:]]\./etc/xdg/autostart/io.github.atvv_bridge.desktop$' <<<"$contents"
+! grep -Eq '[[:space:]]\./usr/lib/systemd/user/atvv-bridge.service$' <<<"$contents"
 grep -Eq '[[:space:]]\./usr/share/doc/atvv-bridge/README.md$' <<<"$contents"
 
 dependencies=$(dpkg-deb --field "$package" Depends)
+grep -Eq 'libgtk-4-1' <<<"$dependencies"
+grep -Eq 'libadwaita-1-0' <<<"$dependencies"
 ! grep -Eqi 'voxtype|fcitx' <<<"$dependencies"
 
 control_files=$(dpkg-deb --ctrl-tarfile "$package" | tar -tf -)
@@ -34,25 +38,22 @@ mkdir -p -- "$user_state" "$(dirname "$user_config")"
 touch "$user_state/retained.wav"
 printf 'keep_wav = true\n' >"$user_config"
 
-payload_files=$(dpkg-deb --fsys-tarfile "$package" | tar -tf -)
-! grep -Ev '^\./($|usr(/|$))' <<<"$payload_files"
 fakeroot dpkg --root="$install_root" --admindir="$admin_dir" --log=/dev/null \
     --force-bad-path --unpack "$package"
-test ! -e "$install_root/etc/systemd/user/default.target.wants/atvv-bridge.service"
 
 systemd-hwdb --root="$install_root" --strict update
 remote_modalias='evdev:input:b0005v2717p32B8e00A4-e0,1,4,14,k71,72,73,74,75'
 remote_properties=$(systemd-hwdb --root="$install_root" query "$remote_modalias")
 grep -Fxq 'KEYBOARD_KEY_7003e=reserved' <<<"$remote_properties"
 
-unit="$install_root/usr/lib/systemd/user/atvv-bridge.service"
-grep -Fxq 'ExecStart=/usr/bin/atvv-bridge' "$unit"
-grep -Fxq 'Restart=on-failure' "$unit"
-grep -Fxq 'WantedBy=default.target' "$unit"
-sed "s|^ExecStart=/usr/bin/atvv-bridge$|ExecStart=$install_root/usr/bin/atvv-bridge|" \
-    "$unit" >"$test_dir/atvv-bridge.service"
-systemd-analyze verify --user --generators=no --man=no \
-    "$test_dir/atvv-bridge.service"
+menu_entry="$install_root/usr/share/applications/io.github.atvv_bridge.desktop"
+autostart_entry="$install_root/etc/xdg/autostart/io.github.atvv_bridge.desktop"
+grep -Fxq 'Type=Application' "$menu_entry"
+grep -Fxq 'Exec=atvv-bridge' "$menu_entry"
+grep -Fxq 'Terminal=false' "$menu_entry"
+grep -Fxq 'Type=Application' "$autostart_entry"
+grep -Fxq 'Exec=atvv-bridge' "$autostart_entry"
+grep -Fxq 'Terminal=false' "$autostart_entry"
 
 fakeroot dpkg --root="$install_root" --admindir="$admin_dir" --log=/dev/null \
     --force-bad-path --remove atvv-bridge
@@ -60,4 +61,5 @@ test -f "$user_state/retained.wav"
 test -f "$user_config"
 test ! -e "$install_root/usr/bin/atvv-bridge"
 test ! -e "$install_root/usr/lib/udev/hwdb.d/90-atvv-bridge.hwdb"
-test ! -e "$unit"
+test ! -e "$menu_entry"
+test ! -e "$autostart_entry"

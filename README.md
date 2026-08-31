@@ -12,8 +12,8 @@ The currently supported remote is the Xiaomi Bluetooth Remote Control 2 Pro
 - A Linux desktop using BlueZ and Fcitx 5.
 - A paired Xiaomi Bluetooth Remote Control 2 Pro.
 - [`voxtype`](https://github.com/peteonrails/voxtype) available in the user
-  service's `PATH`.
-- `fcitx5-commit` available in the user service's `PATH`.
+  session's `PATH`.
+- `fcitx5-commit` available in the user session's `PATH`.
 
 Voxtype and `fcitx5-commit` are runtime integrations rather than Debian package
 dependencies because their installation and configuration are desktop-specific.
@@ -41,8 +41,9 @@ scripts/build-deb.sh /tmp/atvv-packages
 ```
 
 The build uses the locked Cargo dependency versions and the architecture
-reported by `dpkg`. The package test verifies its payload, dependencies,
-systemd unit, hardware database entry, installation, and removal behavior.
+reported by `dpkg`. The package test verifies its desktop and autostart entries,
+runtime dependencies, hardware database entry, installation, and removal
+behavior.
 
 To build only the release binary:
 
@@ -58,35 +59,25 @@ Install the generated package explicitly:
 sudo apt install ./target/debian/atvv-bridge_*.deb
 ```
 
-Installation deliberately does not enable or start the user service. The
-package also installs a hardware database entry for the supported remote. It
-maps only the voice button's repeating F5 scan code to `KEY_RESERVED`, while
+The package installs an application-menu entry and a system-wide XDG autostart
+entry. ATVV Voice Bridge starts with each graphical desktop session and uses
+that user's XDG configuration. To start it immediately after installation,
+select **ATVV Voice Bridge** from the application menu.
+
+Where a StatusNotifier tray is available, closing the status window keeps voice
+input running and the tray menu provides **Show Status** and **Quit** actions.
+Without a tray, closing the window explains that voice input will stop and asks
+for confirmation.
+
+The package also installs a hardware database entry for the supported remote.
+It maps only the voice button's repeating F5 scan code to `KEY_RESERVED`, while
 leaving the other remote buttons unchanged. Disconnect and reconnect the remote
 after installing or removing the package so the mapping is applied to the new
 input device.
 
-Check that BlueZ can see a connected remote with the complete ATVV service:
-
-```sh
-atvv-bridge --check
-```
-
-Then enable and start the bridge for the current user:
-
-```sh
-systemctl --user enable --now atvv-bridge.service
-```
-
-Inspect its status and logs with:
-
-```sh
-systemctl --user status atvv-bridge.service
-journalctl --user -u atvv-bridge.service
-```
-
 ## Configure
 
-Without `--config`, the bridge reads the first applicable standard path:
+The bridge reads the first applicable standard path:
 
 1. `$XDG_CONFIG_HOME/atvv-bridge/config.toml`, when `XDG_CONFIG_HOME` is an
    absolute path.
@@ -120,25 +111,13 @@ directories cause startup to fail with an actionable error. Capture WAV files
 are created privately and may contain dictated speech; protect any custom
 `wav_dir` accordingly.
 
-To use a nonstandard file, start the binary with an explicit path:
-
-```sh
-atvv-bridge --config /absolute/path/to/config.toml
-```
-
-Unlike a missing standard configuration file, a missing explicit file is an
-error. After changing configuration for the installed service, restart it:
-
-```sh
-systemctl --user restart atvv-bridge.service
-```
+Invalid configuration is shown as an actionable failure in the status window.
+After saving a valid replacement, the running desktop application detects it
+and reinitializes the bridge automatically.
 
 ## Remove
 
-Disable the user service before removing the package:
-
 ```sh
-systemctl --user disable --now atvv-bridge.service
 sudo apt remove atvv-bridge
 ```
 

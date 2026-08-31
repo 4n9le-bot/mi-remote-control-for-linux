@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ATVV Voice Bridge
+Comment=Start ATVV Remote voice input with the desktop session
+Exec=atvv-bridge
+Icon=preferences-desktop-peripherals
+Terminal=false
+X-GNOME-Autostart-enabled=true

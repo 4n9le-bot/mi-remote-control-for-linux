@@ -1,48 +1,42 @@
-#[cfg(feature = "desktop")]
-use std::{cell::RefCell, rc::Rc, time::Duration};
-use std::{env, path::PathBuf, process::ExitCode};
+use std::env;
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
 
-#[cfg(feature = "desktop")]
 use adw::prelude::*;
-#[cfg(not(feature = "desktop"))]
-use atvv_bridge::Application;
-#[cfg(feature = "desktop")]
+use atvv_bridge::ConfigSelection;
 use atvv_bridge::{
     AtvvProfileReadiness, BatteryStatus, CaptureStatus, DesktopApplication, DesktopShell,
     DesktopStatus, InProcessVoiceBridge, RecentWavHandoff, RecoveryStatus, RemoteStatus,
     WavHandoffActivity, WavHandoffOutcome,
 };
-use atvv_bridge::{ConfigSelection, Readiness, check_readiness, system::SystemBoundaries};
-use clap::Parser;
 
-#[derive(Debug, Parser)]
-#[command(version, about)]
-struct Cli {
-    #[arg(long, value_name = "PATH")]
-    config: Option<PathBuf>,
-    #[arg(long)]
-    check: bool,
+#[derive(Debug, Clone, Copy)]
+enum DesktopEvent {
+    ActivateRequested,
+    CloseRequested,
+    CloseConfirmed(bool),
+    QuitRequested,
 }
 
-#[cfg(feature = "desktop")]
 fn main() {
-    let cli = Cli::parse();
-    if cli.check {
-        let exit_code = run_check();
-        if exit_code == ExitCode::SUCCESS {
-            return;
-        }
-        std::process::exit(1);
-    }
     let selection = ConfigSelection::resolve(
-        cli.config,
+        None,
         env::var_os("XDG_CONFIG_HOME").as_deref(),
         env::var_os("HOME").as_deref(),
     );
     let desktop = Rc::new(RefCell::new(DesktopApplication::new(
         InProcessVoiceBridge::new(selection),
     )));
-    let shell = Rc::new(RefCell::new(GtkDesktopShell::default()));
+    let (event_sender, event_receiver) = mpsc::channel();
+    let shell = Rc::new(RefCell::new(GtkDesktopShell::new(event_sender)));
     let application = adw::Application::builder()
         .application_id("io.github.atvv_bridge")
         .build();
@@ -58,74 +52,39 @@ fn main() {
         }
     });
     gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
-        desktop
-            .borrow_mut()
-            .refresh_status(&mut *shell.borrow_mut());
+        let mut desktop = desktop.borrow_mut();
+        let mut shell = shell.borrow_mut();
+        while let Ok(event) = event_receiver.try_recv() {
+            match event {
+                DesktopEvent::ActivateRequested => {
+                    if let Err(error) = desktop.activate(&mut *shell) {
+                        eprintln!(
+                            "atvv-bridge: could not activate the desktop application: {error}"
+                        );
+                    }
+                }
+                DesktopEvent::CloseRequested => desktop.close_requested(&mut *shell),
+                DesktopEvent::CloseConfirmed(confirmed) => {
+                    desktop.close_confirmed(confirmed, &mut *shell);
+                }
+                DesktopEvent::QuitRequested => desktop.quit_requested(&mut *shell),
+            }
+        }
+        desktop.refresh_status(&mut *shell);
         gtk::glib::ControlFlow::Continue
     });
     application.run_with_args(&["atvv-bridge"]);
 }
 
-#[cfg(not(feature = "desktop"))]
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-    if cli.check {
-        return run_check();
-    }
-    let mut boundaries = SystemBoundaries::default();
-    let selection = ConfigSelection::resolve(
-        cli.config,
-        env::var_os("XDG_CONFIG_HOME").as_deref(),
-        env::var_os("HOME").as_deref(),
-    );
-    match Application::start(selection, &mut boundaries) {
-        Ok(application) => match application.run() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("atvv-bridge: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        Err(error) => {
-            eprintln!("atvv-bridge: {error}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-fn run_check() -> ExitCode {
-    let mut boundaries = SystemBoundaries::default();
-    match check_readiness(&mut boundaries) {
-        Ok(Readiness::Ready { address }) => {
-            eprintln!("event=check_selected_atvv_remote address={address:?} ready=true");
-            ExitCode::SUCCESS
-        }
-        Ok(Readiness::NotReady { address, reason }) => {
-            if let Some(address) = address {
-                eprintln!(
-                    "event=check_selected_atvv_remote address={address:?} ready=false reason={reason:?}"
-                );
-            } else {
-                eprintln!("event=check_failed ready=false reason={reason:?}");
-            }
-            ExitCode::FAILURE
-        }
-        Err(error) => {
-            eprintln!("atvv-bridge: BlueZ readiness check failed: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-#[cfg(feature = "desktop")]
-#[derive(Default)]
 struct GtkDesktopShell {
     application: Option<adw::Application>,
     window: Option<adw::ApplicationWindow>,
     status_labels: Option<StatusLabels>,
+    event_sender: mpsc::Sender<DesktopEvent>,
+    tray_available: Arc<AtomicBool>,
+    tray: Option<ksni::blocking::Handle<StatusTray>>,
 }
 
-#[cfg(feature = "desktop")]
 struct StatusLabels {
     actionable_failure: gtk::Label,
     remote: gtk::Label,
@@ -138,14 +97,107 @@ struct StatusLabels {
     diagnostics: gtk::Label,
 }
 
-#[cfg(feature = "desktop")]
 impl GtkDesktopShell {
+    fn new(event_sender: mpsc::Sender<DesktopEvent>) -> Self {
+        Self {
+            application: None,
+            window: None,
+            status_labels: None,
+            event_sender,
+            tray_available: Arc::new(AtomicBool::new(false)),
+            tray: None,
+        }
+    }
+
     fn set_application(&mut self, application: &adw::Application) {
         self.application = Some(application.clone());
     }
+
+    fn start_tray(&mut self) {
+        use ksni::blocking::TrayMethods;
+
+        let available = Arc::new(AtomicBool::new(false));
+        let tray = StatusTray {
+            event_sender: self.event_sender.clone(),
+            available: Arc::clone(&available),
+        };
+        match tray.spawn() {
+            Ok(handle) => {
+                self.tray_available = available;
+                self.tray = Some(handle);
+            }
+            Err(error) => {
+                self.tray_available.store(false, Ordering::Relaxed);
+                eprintln!("atvv-bridge: system tray unavailable: {error}");
+            }
+        }
+    }
 }
 
-#[cfg(feature = "desktop")]
+struct StatusTray {
+    event_sender: mpsc::Sender<DesktopEvent>,
+    available: Arc<AtomicBool>,
+}
+
+impl StatusTray {
+    fn request_activation(&self) {
+        let _ = self.event_sender.send(DesktopEvent::ActivateRequested);
+    }
+}
+
+impl ksni::Tray for StatusTray {
+    fn id(&self) -> String {
+        "atvv-bridge".into()
+    }
+
+    fn title(&self) -> String {
+        "ATVV Voice Bridge".into()
+    }
+
+    fn icon_name(&self) -> String {
+        "preferences-desktop-peripherals-symbolic".into()
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.request_activation();
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+
+        vec![
+            StandardItem {
+                label: "Show Status".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    tray.request_activation();
+                }),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            StandardItem {
+                label: "Quit".into(),
+                icon_name: "application-exit-symbolic".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.event_sender.send(DesktopEvent::QuitRequested);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+
+    fn watcher_online(&self) {
+        self.available.store(true, Ordering::Relaxed);
+    }
+
+    fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
+        self.available.store(false, Ordering::Relaxed);
+        self.request_activation();
+        true
+    }
+}
+
 impl DesktopShell for GtkDesktopShell {
     fn create_status_window(&mut self) {
         let application = self
@@ -189,16 +241,21 @@ impl DesktopShell for GtkDesktopShell {
             .child(&status_labels.diagnostics)
             .build();
         statuses.append(&diagnostics);
-        self.window = Some(
-            adw::ApplicationWindow::builder()
-                .application(application)
-                .title("ATVV Voice Bridge")
-                .default_width(360)
-                .default_height(220)
-                .content(&statuses)
-                .build(),
-        );
+        let window = adw::ApplicationWindow::builder()
+            .application(application)
+            .title("ATVV Voice Bridge")
+            .default_width(360)
+            .default_height(220)
+            .content(&statuses)
+            .build();
+        let event_sender = self.event_sender.clone();
+        window.connect_close_request(move |_| {
+            let _ = event_sender.send(DesktopEvent::CloseRequested);
+            gtk::glib::Propagation::Stop
+        });
+        self.window = Some(window);
         self.status_labels = Some(status_labels);
+        self.start_tray();
         self.display_status(&DesktopStatus::default());
     }
 
@@ -288,5 +345,42 @@ impl DesktopShell for GtkDesktopShell {
         labels.recovery.set_label(&recovery);
         labels.battery.set_label(&battery);
         labels.diagnostics.set_label(&diagnostics);
+    }
+
+    fn tray_available(&self) -> bool {
+        self.tray_available.load(Ordering::Relaxed)
+    }
+
+    fn hide_status_window(&mut self) {
+        self.window
+            .as_ref()
+            .expect("status window is created before it is hidden")
+            .set_visible(false);
+    }
+
+    fn confirm_close_quits_bridge(&mut self) {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Quit ATVV Voice Bridge?")
+            .body("No system tray is available. Closing the window will stop voice input.")
+            .build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("quit", "Quit")]);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
+        let event_sender = self.event_sender.clone();
+        dialog.choose(
+            self.window.as_ref(),
+            None::<&gtk::gio::Cancellable>,
+            move |response| {
+                let _ = event_sender.send(DesktopEvent::CloseConfirmed(response == "quit"));
+            },
+        );
+    }
+
+    fn quit(&mut self) {
+        self.application
+            .as_ref()
+            .expect("GTK application is set before quit")
+            .quit();
     }
 }

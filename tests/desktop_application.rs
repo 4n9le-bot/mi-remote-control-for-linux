@@ -34,6 +34,10 @@ impl VoiceBridge for FakeBridge {
 struct FakeDesktopShell {
     windows_created: usize,
     windows_presented: usize,
+    windows_hidden: usize,
+    close_confirmations: usize,
+    quits: usize,
+    tray_available: bool,
     statuses: Vec<DesktopStatus>,
 }
 
@@ -48,6 +52,22 @@ impl DesktopShell for FakeDesktopShell {
 
     fn display_status(&mut self, status: &DesktopStatus) {
         self.statuses.push(status.clone());
+    }
+
+    fn tray_available(&self) -> bool {
+        self.tray_available
+    }
+
+    fn hide_status_window(&mut self) {
+        self.windows_hidden += 1;
+    }
+
+    fn confirm_close_quits_bridge(&mut self) {
+        self.close_confirmations += 1;
+    }
+
+    fn quit(&mut self) {
+        self.quits += 1;
     }
 }
 
@@ -97,6 +117,43 @@ fn repeated_activation_reuses_the_bridge_and_status_window() {
     assert_eq!(application.bridge().starts, 1);
     assert_eq!(shell.windows_created, 1);
     assert_eq!(shell.windows_presented, 2);
+}
+
+#[test]
+fn close_request_hides_the_window_when_a_tray_is_available() {
+    let mut application = DesktopApplication::new(FakeBridge::default());
+    let mut shell = FakeDesktopShell {
+        tray_available: true,
+        ..FakeDesktopShell::default()
+    };
+
+    application.close_requested(&mut shell);
+
+    assert_eq!(shell.windows_hidden, 1);
+    assert_eq!(shell.close_confirmations, 0);
+    assert_eq!(shell.quits, 0);
+}
+
+#[test]
+fn close_request_without_a_tray_requires_confirmation() {
+    let mut application = DesktopApplication::new(FakeBridge::default());
+    let mut shell = FakeDesktopShell::default();
+
+    application.close_requested(&mut shell);
+    application.close_confirmed(false, &mut shell);
+
+    assert_eq!(shell.windows_hidden, 0);
+    assert_eq!(shell.close_confirmations, 1);
+    assert_eq!(shell.quits, 0);
+}
+
+#[test]
+fn confirmed_no_tray_close_stops_the_application() {
+    let mut application = DesktopApplication::new(FakeBridge::default());
+    let mut shell = FakeDesktopShell::default();
+
+    application.close_confirmed(true, &mut shell);
+    assert_eq!(shell.quits, 1);
 }
 
 #[test]
