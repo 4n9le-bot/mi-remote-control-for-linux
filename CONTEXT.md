@@ -17,7 +17,7 @@ A bounded voice utterance beginning with an ATVV `AUDIO_START` control event and
 _Avoid_: Recording session, stream
 
 **WAV Handoff**:
-Delivery of a completed Capture to Voxtype as a temporary WAV file for transcription.
+将完整 Capture 作为 WAV 交给所选 Transcription Provider 识别的过程。
 _Avoid_: WAV output, live input
 
 **Transcription Provider**:

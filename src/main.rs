@@ -147,12 +147,56 @@ struct TranscriptionWidgets {
     model: gtk::Entry,
     resource: gtk::Entry,
     region: gtk::DropDown,
-    secrets: Vec<gtk::PasswordEntry>,
+    credentials: CredentialWidgets,
     groups: Vec<gtk::Box>,
     notice: gtk::Label,
     save: gtk::Button,
     delete: gtk::Button,
     reload: gtk::Button,
+}
+
+#[derive(Clone)]
+struct CredentialWidgets {
+    openai_api_key: gtk::PasswordEntry,
+    volcengine_api_key: gtk::PasswordEntry,
+    aliyun_app_key: gtk::PasswordEntry,
+    aliyun_access_key_id: gtk::PasswordEntry,
+    aliyun_access_key_secret: gtk::PasswordEntry,
+}
+impl CredentialWidgets {
+    fn entries(&self) -> [&gtk::PasswordEntry; 5] {
+        [
+            &self.openai_api_key,
+            &self.volcengine_api_key,
+            &self.aliyun_app_key,
+            &self.aliyun_access_key_id,
+            &self.aliyun_access_key_secret,
+        ]
+    }
+    fn read(&self, provider: Provider) -> Option<Credentials> {
+        let credentials = match provider {
+            Provider::Voxtype => return None,
+            Provider::Openai => Credentials {
+                api_key: self.openai_api_key.text().to_string(),
+                ..Default::default()
+            },
+            Provider::Volcengine => Credentials {
+                api_key: self.volcengine_api_key.text().to_string(),
+                ..Default::default()
+            },
+            Provider::Aliyun => Credentials {
+                app_key: self.aliyun_app_key.text().to_string(),
+                access_key_id: self.aliyun_access_key_id.text().to_string(),
+                access_key_secret: self.aliyun_access_key_secret.text().to_string(),
+                ..Default::default()
+            },
+        };
+        let any = !credentials.api_key.is_empty()
+            || !credentials.app_key.is_empty()
+            || !credentials.access_key_id.is_empty()
+            || !credentials.access_key_secret.is_empty();
+        any.then_some(credentials)
+    }
 }
 
 fn selected_provider(selector: &gtk::DropDown) -> Provider {
@@ -204,33 +248,19 @@ impl GtkDesktopShell {
         field(&groups[0], "模型", model.upcast_ref());
         field(&groups[1], "资源 ID", resource.upcast_ref());
         field(&groups[2], "区域", region.upcast_ref());
-        let names = [
-            "OpenAI API Key",
-            "火山 API Key",
-            "阿里 AppKey",
-            "阿里 AccessKey ID",
-            "阿里 AccessKey Secret",
-        ];
-        let secrets = names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                let entry = gtk::PasswordEntry::builder().show_peek_icon(false).build();
-                entry.set_placeholder_text(Some("留空保留已有凭据"));
-                field(
-                    &groups[if index == 0 {
-                        0
-                    } else if index < 2 {
-                        1
-                    } else {
-                        2
-                    }],
-                    name,
-                    entry.upcast_ref(),
-                );
-                entry
-            })
-            .collect::<Vec<_>>();
+        let secret_field = |group: &gtk::Box, name: &str| {
+            let entry = gtk::PasswordEntry::builder().show_peek_icon(false).build();
+            entry.set_placeholder_text(Some("留空保留已有凭据"));
+            field(group, name, entry.upcast_ref());
+            entry
+        };
+        let credentials = CredentialWidgets {
+            openai_api_key: secret_field(&groups[0], "OpenAI API Key"),
+            volcengine_api_key: secret_field(&groups[1], "火山 API Key"),
+            aliyun_app_key: secret_field(&groups[2], "阿里 AppKey"),
+            aliyun_access_key_id: secret_field(&groups[2], "阿里 AccessKey ID"),
+            aliyun_access_key_secret: secret_field(&groups[2], "阿里 AccessKey Secret"),
+        };
         for group in &groups {
             group.set_visible(false);
             content.append(group);
@@ -257,14 +287,14 @@ impl GtkDesktopShell {
         actions.append(&save);
         content.append(&actions);
         let groups_changed = groups.clone();
-        let entries_changed = secrets.clone();
+        let entries_changed = credentials.clone();
         let notice_changed = notice.clone();
         let delete_changed = delete.clone();
         provider.connect_selected_notify(move |selector| {
             for (index, group) in groups_changed.iter().enumerate() {
                 group.set_visible(selector.selected() as usize == index + 1);
             }
-            for entry in &entries_changed {
+            for entry in entries_changed.entries() {
                 entry.set_text("");
             }
             delete_changed.set_sensitive(selector.selected() != 0);
@@ -274,30 +304,10 @@ impl GtkDesktopShell {
         let selector = provider.clone();
         let model_input = model.clone();
         let region_input = region.clone();
-        let entries = secrets.clone();
+        let entries = credentials.clone();
         save.connect_clicked(move |_| {
             let provider = selected_provider(&selector);
-            let fields = entries
-                .iter()
-                .map(|entry| entry.text().to_string())
-                .collect::<Vec<_>>();
-            let any = match provider {
-                Provider::Voxtype => false,
-                Provider::Openai => !fields[0].is_empty(),
-                Provider::Volcengine => fields[1..2].iter().any(|s| !s.is_empty()),
-                Provider::Aliyun => fields[2..].iter().any(|s| !s.is_empty()),
-            };
-            let credentials = any.then(|| Credentials {
-                api_key: fields[if provider == Provider::Volcengine {
-                    1
-                } else {
-                    0
-                }]
-                .clone(),
-                app_key: fields[2].clone(),
-                access_key_id: fields[3].clone(),
-                access_key_secret: fields[4].clone(),
-            });
+            let credentials = entries.read(provider);
             let settings = TranscriptionSettings {
                 provider,
                 openai_model: model_input.text().to_string(),
@@ -334,7 +344,7 @@ impl GtkDesktopShell {
                 model,
                 resource,
                 region,
-                secrets,
+                credentials,
                 groups,
                 notice,
                 save,
@@ -690,7 +700,7 @@ impl DesktopShell for GtkDesktopShell {
             .set_sensitive(!busy && widgets.provider.selected() != 0);
         widgets.model.set_sensitive(!busy);
         widgets.region.set_sensitive(!busy);
-        for entry in &widgets.secrets {
+        for entry in widgets.credentials.entries() {
             entry.set_sensitive(!busy);
         }
         match result {
@@ -718,7 +728,7 @@ impl DesktopShell for GtkDesktopShell {
                         "cn-shenzhen" => 2,
                         _ => 0,
                     });
-                for entry in &widgets.secrets {
+                for entry in widgets.credentials.entries() {
                     entry.set_text("");
                 }
                 for (index, group) in widgets.groups.iter().enumerate() {
