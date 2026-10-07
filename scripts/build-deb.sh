@@ -60,7 +60,7 @@ shlib_output=$(
         -e"debian/$package_name/usr/bin/atvv-bridge" \
         -e"debian/$package_name/usr/libexec/atvv-bridge/atvv-button-mapping-helper"
 )
-dependencies="${shlib_output#shlibs:Depends=}, pkexec, udev"
+dependencies="${shlib_output#shlibs:Depends=}, pkexec, udev, libsecret-tools, ca-certificates"
 installed_size=$(du -sk "$package_root" | cut -f1)
 
 mkdir -p "$package_root/DEBIAN"

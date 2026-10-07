@@ -1,6 +1,6 @@
 # ATVV Voice Bridge
 
-This context describes how a Bluetooth voice remote supplies an utterance to Voxtype on Linux.
+本上下文描述蓝牙遥控器在 Linux 上提供语音 Capture，经所选识别服务转为文字并输入当前应用。
 
 ## Language
 
@@ -19,6 +19,14 @@ _Avoid_: Recording session, stream
 **WAV Handoff**:
 Delivery of a completed Capture to Voxtype as a temporary WAV file for transcription.
 _Avoid_: WAV output, live input
+
+**Transcription Provider**:
+将完整 Capture 转为文字的识别服务，包括默认的 Voxtype 和用户选择的在线服务。
+_Avoid_: Text Commit, 输入法
+
+**Online Mode**:
+用户主动选择在线 Transcription Provider 并提供其所需凭据后，将完整 Capture 交给该服务识别的模式。
+_Avoid_: 自动回退, 流式识别
 
 **Text Commit**:
 Insertion of a successful Voxtype transcript into the application currently focused through Fcitx 5.

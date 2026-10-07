@@ -31,6 +31,7 @@ grep -Eq 'libgtk-4-1' <<<"$dependencies"
 grep -Eq 'libadwaita-1-0' <<<"$dependencies"
 grep -Eq '(^|, )pkexec([ (]|,|$)' <<<"$dependencies"
 grep -Eq '(^|, )udev([ (]|,|$)' <<<"$dependencies"
+grep -Eq '(^|, )libsecret-tools([ (]|,|$)' <<<"$dependencies"
 ! grep -Eqi 'voxtype|fcitx' <<<"$dependencies"
 
 control_files=$(dpkg-deb --ctrl-tarfile "$package" | tar -tf -)

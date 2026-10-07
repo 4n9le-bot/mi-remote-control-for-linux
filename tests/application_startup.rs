@@ -35,6 +35,12 @@ struct ControlledBoundaries {
     battery_results: VecDeque<io::Result<Option<atvv_bridge::BatteryPercentage>>>,
     battery_reads: Vec<String>,
     scripted_transport: VecDeque<io::Result<AtvvEvent>>,
+    online_results: VecDeque<Result<Option<String>, String>>,
+    online_calls: Vec<atvv_bridge::transcription::TranscriptionSettings>,
+    live_provider: Option<atvv_bridge::transcription::Provider>,
+    change_provider_on_audio: Option<atvv_bridge::transcription::Provider>,
+    cancel_after_transcription: bool,
+    cancelled: bool,
 }
 
 impl AtvvTransport for ControlledBoundaries {
@@ -63,6 +69,11 @@ impl AtvvTransport for ControlledBoundaries {
             .atvv_events
             .pop_front()
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "script exhausted"))?;
+        if matches!(event, AtvvEvent::AudioNotification(_)) {
+            if let Some(provider) = self.change_provider_on_audio.take() {
+                self.live_provider = Some(provider);
+            }
+        }
         if let AtvvEvent::ControlNotification(notification) = &event {
             self.now = self.now.max(
                 notification
@@ -84,6 +95,29 @@ impl AtvvTransport for ControlledBoundaries {
 }
 
 impl ProcessExecutor for ControlledBoundaries {
+    fn capture_transcription_settings(
+        &mut self,
+        configured: &atvv_bridge::transcription::TranscriptionSettings,
+    ) -> atvv_bridge::transcription::TranscriptionSettings {
+        atvv_bridge::transcription::TranscriptionSettings {
+            provider: self.live_provider.unwrap_or(configured.provider),
+            ..configured.clone()
+        }
+    }
+    fn transcribe_online(
+        &mut self,
+        settings: &atvv_bridge::transcription::TranscriptionSettings,
+        _: &[u8],
+    ) -> Result<Option<String>, String> {
+        self.online_calls.push(settings.clone());
+        self.cancelled = self.cancel_after_transcription;
+        self.online_results
+            .pop_front()
+            .unwrap_or(Err("在线识别失败".into()))
+    }
+    fn cancellation_requested(&self) -> bool {
+        self.cancelled
+    }
     fn execute(&mut self, command: &Command) -> io::Result<CommandOutput> {
         self.commands.push(command.clone());
         self.now += self.process_durations.pop_front().unwrap_or_default();
@@ -1476,6 +1510,85 @@ fn run_capture(boundaries: &mut ControlledBoundaries) {
         .expect("startup should succeed")
         .run()
         .expect("the Capture should leave the daemon usable");
+}
+
+#[test]
+fn online_capture_commits_once_and_keeps_the_provider_selected_at_start() {
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.live_provider = Some(atvv_bridge::transcription::Provider::Openai);
+    boundaries.change_provider_on_audio = Some(atvv_bridge::transcription::Provider::Volcengine);
+    boundaries
+        .online_results
+        .push_back(Ok(Some("文本\n'$(echo unsafe)'".into())));
+    boundaries.process_results = [successful_process("")].into();
+    run_capture(&mut boundaries);
+    assert_eq!(
+        boundaries.online_calls[0].provider,
+        atvv_bridge::transcription::Provider::Openai
+    );
+    assert_eq!(
+        boundaries.live_provider,
+        Some(atvv_bridge::transcription::Provider::Volcengine)
+    );
+    assert_eq!(boundaries.commands.len(), 1);
+    assert_eq!(boundaries.commands[0].program, "fcitx5-commit");
+    assert_eq!(
+        boundaries.commands[0].args,
+        ["--text", "文本\n'$(echo unsafe)'"]
+    );
+    assert_eq!(boundaries.removed_files.len(), 1);
+}
+
+#[test]
+fn online_failures_do_not_fallback_retry_or_delete_wav() {
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.live_provider = Some(atvv_bridge::transcription::Provider::Aliyun);
+    boundaries
+        .online_results
+        .push_back(Err("在线服务限流，请稍后重试".into()));
+    run_capture(&mut boundaries);
+    assert_eq!(boundaries.online_calls.len(), 1);
+    assert!(boundaries.commands.is_empty() && boundaries.removed_files.is_empty());
+    assert!(boundaries.events.iter().any(|event| matches!(
+        event,
+        OperationalEvent::WavHandoffFailed {
+            retained_wav: Some(_),
+            stage: IntegrationStage::Transcription,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn cancelled_online_result_never_commits_late_text() {
+    let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+    boundaries.live_provider = Some(atvv_bridge::transcription::Provider::Openai);
+    boundaries.cancel_after_transcription = true;
+    boundaries
+        .online_results
+        .push_back(Ok(Some("late-transcript-marker".into())));
+    run_capture(&mut boundaries);
+    assert!(boundaries.commands.is_empty() && boundaries.removed_files.is_empty());
+    assert!(!format!("{:?}", boundaries.events).contains("late-transcript-marker"));
+}
+
+#[test]
+fn online_no_speech_and_keep_wav_preserve_the_existing_lifecycle() {
+    for (text, keep) in [(None, false), (Some("文字".into()), true)] {
+        let mut boundaries = capture_boundaries([AtvvEvent::AudioNotification(vec![0x11; 120])]);
+        boundaries.config = Some(format!("keep_wav = {keep}"));
+        boundaries.live_provider = Some(atvv_bridge::transcription::Provider::Openai);
+        boundaries.online_results.push_back(Ok(text.clone()));
+        Application::start(
+            ConfigSelection::Explicit("/config.toml".into()),
+            &mut boundaries,
+        )
+        .unwrap()
+        .run()
+        .unwrap();
+        assert_eq!(boundaries.commands.len(), usize::from(text.is_some()));
+        assert_eq!(boundaries.removed_files.len(), usize::from(!keep));
+    }
 }
 
 fn wav_samples(boundaries: &ControlledBoundaries) -> Vec<i16> {

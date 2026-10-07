@@ -19,8 +19,12 @@ use atvv_bridge::{
     WavHandoffActivity, WavHandoffOutcome,
     button_mapping::{ButtonId, LOGICAL_KEYS, MappingTarget},
 };
+use atvv_bridge::{
+    transcription::{Credentials, Provider, TranscriptionSettings},
+    transcription_settings::{SettingsPresentation, SettingsRequest},
+};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum DesktopEvent {
     ActivateRequested,
     ButtonMappingRequested,
@@ -28,6 +32,7 @@ enum DesktopEvent {
     CloseRequested,
     CloseConfirmed(bool),
     QuitRequested,
+    TranscriptionSettings(SettingsRequest),
 }
 
 fn main() {
@@ -83,6 +88,9 @@ fn main() {
                     desktop.close_confirmed(confirmed, &mut *shell);
                 }
                 DesktopEvent::QuitRequested => desktop.quit_requested(&mut *shell),
+                DesktopEvent::TranscriptionSettings(request) => {
+                    desktop.transcription_settings_event(request, &mut *shell)
+                }
             }
         }
         desktop.refresh_status(&mut *shell);
@@ -98,6 +106,7 @@ struct GtkDesktopShell {
     status_labels: Option<StatusLabels>,
     page_stack: Option<gtk::Stack>,
     mapping_widgets: Option<MappingWidgets>,
+    transcription_widgets: Option<TranscriptionWidgets>,
     event_sender: mpsc::Sender<DesktopEvent>,
     tray_available: Arc<AtomicBool>,
     tray: Option<ksni::blocking::Handle<StatusTray>>,
@@ -133,6 +142,209 @@ struct MappingRow {
     mapping_details: gtk::Label,
 }
 
+struct TranscriptionWidgets {
+    provider: gtk::DropDown,
+    model: gtk::Entry,
+    resource: gtk::Entry,
+    region: gtk::DropDown,
+    secrets: Vec<gtk::PasswordEntry>,
+    groups: Vec<gtk::Box>,
+    notice: gtk::Label,
+    save: gtk::Button,
+    delete: gtk::Button,
+    reload: gtk::Button,
+}
+
+fn selected_provider(selector: &gtk::DropDown) -> Provider {
+    [
+        Provider::Voxtype,
+        Provider::Openai,
+        Provider::Volcengine,
+        Provider::Aliyun,
+    ]
+    .get(selector.selected() as usize)
+    .copied()
+    .unwrap_or_default()
+}
+
+impl GtkDesktopShell {
+    fn build_transcription_page(&self) -> (gtk::ScrolledWindow, TranscriptionWidgets) {
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(24);
+        content.set_margin_bottom(24);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        let explanation = gtk::Label::new(Some(
+            "默认使用 Voxtype。在线模式会将完整录音提交所选云服务，可能产生服务费用。松开语音键后识别，结果输入当前应用。凭据仅存当前用户系统密钥环。",
+        ));
+        explanation.set_wrap(true);
+        explanation.set_xalign(0.0);
+        content.append(&explanation);
+        let provider =
+            gtk::DropDown::from_strings(&["Voxtype（默认）", "OpenAI", "火山引擎", "阿里云"]);
+        provider.update_property(&[gtk::accessible::Property::Label("语音识别 Provider")]);
+        content.append(&provider);
+        let defaults = TranscriptionSettings::default();
+        let model = gtk::Entry::builder().text(&defaults.openai_model).build();
+        let resource = gtk::Entry::builder()
+            .text(&defaults.volcengine_resource)
+            .editable(false)
+            .build();
+        let region = gtk::DropDown::from_strings(&["上海", "北京", "深圳"]);
+        let groups = (0..3)
+            .map(|_| gtk::Box::new(gtk::Orientation::Vertical, 8))
+            .collect::<Vec<_>>();
+        let field = |group: &gtk::Box, label: &str, widget: &gtk::Widget| {
+            let text = gtk::Label::new(Some(label));
+            text.set_xalign(0.0);
+            group.append(&text);
+            widget.update_property(&[gtk::accessible::Property::Label(label)]);
+            group.append(widget);
+        };
+        field(&groups[0], "模型", model.upcast_ref());
+        field(&groups[1], "资源 ID", resource.upcast_ref());
+        field(&groups[2], "区域", region.upcast_ref());
+        let names = [
+            "OpenAI API Key",
+            "火山 API Key",
+            "阿里 AppKey",
+            "阿里 AccessKey ID",
+            "阿里 AccessKey Secret",
+        ];
+        let secrets = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let entry = gtk::PasswordEntry::builder().show_peek_icon(false).build();
+                entry.set_placeholder_text(Some("留空保留已有凭据"));
+                field(
+                    &groups[if index == 0 {
+                        0
+                    } else if index < 2 {
+                        1
+                    } else {
+                        2
+                    }],
+                    name,
+                    entry.upcast_ref(),
+                );
+                entry
+            })
+            .collect::<Vec<_>>();
+        for group in &groups {
+            group.set_visible(false);
+            content.append(group);
+        }
+        let hint = gtk::Label::new(Some(
+            "修改凭据时填写当前服务的全部字段；全部留空则使用已有凭据。阿里云单次录音最多 60 秒。在线失败保留 WAV，不自动回退；可手动切回 Voxtype。",
+        ));
+        hint.set_wrap(true);
+        hint.set_xalign(0.0);
+        content.append(&hint);
+        let notice = gtk::Label::new(None);
+        notice.set_wrap(true);
+        notice.set_xalign(0.0);
+        content.append(&notice);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let save = gtk::Button::with_label("保存并使用");
+        save.add_css_class("suggested-action");
+        let delete = gtk::Button::with_label("删除所选服务凭据");
+        delete.add_css_class("destructive-action");
+        delete.set_sensitive(false);
+        let reload = gtk::Button::with_label("重新读取");
+        actions.append(&reload);
+        actions.append(&delete);
+        actions.append(&save);
+        content.append(&actions);
+        let groups_changed = groups.clone();
+        let entries_changed = secrets.clone();
+        let notice_changed = notice.clone();
+        let delete_changed = delete.clone();
+        provider.connect_selected_notify(move |selector| {
+            for (index, group) in groups_changed.iter().enumerate() {
+                group.set_visible(selector.selected() as usize == index + 1);
+            }
+            for entry in &entries_changed {
+                entry.set_text("");
+            }
+            delete_changed.set_sensitive(selector.selected() != 0);
+            notice_changed.set_label("选择尚未保存。保存前不会改变当前识别服务。");
+        });
+        let sender = self.event_sender.clone();
+        let selector = provider.clone();
+        let model_input = model.clone();
+        let region_input = region.clone();
+        let entries = secrets.clone();
+        save.connect_clicked(move |_| {
+            let provider = selected_provider(&selector);
+            let fields = entries
+                .iter()
+                .map(|entry| entry.text().to_string())
+                .collect::<Vec<_>>();
+            let any = match provider {
+                Provider::Voxtype => false,
+                Provider::Openai => !fields[0].is_empty(),
+                Provider::Volcengine => fields[1..2].iter().any(|s| !s.is_empty()),
+                Provider::Aliyun => fields[2..].iter().any(|s| !s.is_empty()),
+            };
+            let credentials = any.then(|| Credentials {
+                api_key: fields[if provider == Provider::Volcengine {
+                    1
+                } else {
+                    0
+                }]
+                .clone(),
+                app_key: fields[2].clone(),
+                access_key_id: fields[3].clone(),
+                access_key_secret: fields[4].clone(),
+            });
+            let settings = TranscriptionSettings {
+                provider,
+                openai_model: model_input.text().to_string(),
+                aliyun_region: ["cn-shanghai", "cn-beijing", "cn-shenzhen"]
+                    [region_input.selected().min(2) as usize]
+                    .into(),
+                ..Default::default()
+            };
+            let _ = sender.send(DesktopEvent::TranscriptionSettings(SettingsRequest::Save {
+                settings,
+                credentials,
+            }));
+        });
+        let sender = self.event_sender.clone();
+        let selector = provider.clone();
+        delete.connect_clicked(move |_| {
+            let _ = sender.send(DesktopEvent::TranscriptionSettings(
+                SettingsRequest::Delete(selected_provider(&selector)),
+            ));
+        });
+        let sender = self.event_sender.clone();
+        reload.connect_clicked(move |_| {
+            let _ = sender.send(DesktopEvent::TranscriptionSettings(
+                SettingsRequest::Inspect,
+            ));
+        });
+        (
+            gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .child(&content)
+                .build(),
+            TranscriptionWidgets {
+                provider,
+                model,
+                resource,
+                region,
+                secrets,
+                groups,
+                notice,
+                save,
+                delete,
+                reload,
+            },
+        )
+    }
+}
+
 impl GtkDesktopShell {
     fn new(event_sender: mpsc::Sender<DesktopEvent>) -> Self {
         Self {
@@ -141,6 +353,7 @@ impl GtkDesktopShell {
             status_labels: None,
             page_stack: None,
             mapping_widgets: None,
+            transcription_widgets: None,
             event_sender,
             tray_available: Arc::new(AtomicBool::new(false)),
             tray: None,
@@ -464,6 +677,66 @@ impl ksni::Tray for StatusTray {
 }
 
 impl DesktopShell for GtkDesktopShell {
+    fn render_transcription_settings(&mut self, result: &Result<SettingsPresentation, String>) {
+        let Some(widgets) = &self.transcription_widgets else {
+            return;
+        };
+        let busy = result.as_ref().is_ok_and(|p| p.busy);
+        widgets.save.set_sensitive(!busy);
+        widgets.reload.set_sensitive(!busy);
+        widgets.provider.set_sensitive(!busy);
+        widgets
+            .delete
+            .set_sensitive(!busy && widgets.provider.selected() != 0);
+        widgets.model.set_sensitive(!busy);
+        widgets.region.set_sensitive(!busy);
+        for entry in &widgets.secrets {
+            entry.set_sensitive(!busy);
+        }
+        match result {
+            Err(error) => widgets.notice.set_label(error),
+            Ok(presentation) if presentation.busy => {
+                widgets.notice.set_label(&presentation.message)
+            }
+            Ok(presentation) => {
+                widgets
+                    .provider
+                    .set_selected(match presentation.settings.provider {
+                        Provider::Voxtype => 0,
+                        Provider::Openai => 1,
+                        Provider::Volcengine => 2,
+                        Provider::Aliyun => 3,
+                    });
+                widgets.model.set_text(&presentation.settings.openai_model);
+                widgets
+                    .resource
+                    .set_text(&presentation.settings.volcengine_resource);
+                widgets
+                    .region
+                    .set_selected(match presentation.settings.aliyun_region.as_str() {
+                        "cn-beijing" => 1,
+                        "cn-shenzhen" => 2,
+                        _ => 0,
+                    });
+                for entry in &widgets.secrets {
+                    entry.set_text("");
+                }
+                for (index, group) in widgets.groups.iter().enumerate() {
+                    group.set_visible(widgets.provider.selected() as usize == index + 1);
+                }
+                widgets.notice.set_label(&format!(
+                    "当前生效：{}；{}。{}",
+                    presentation.settings.provider.key(),
+                    if presentation.configured {
+                        "凭据已配置（Voxtype 无需凭据）"
+                    } else {
+                        "凭据缺失，请配置或切回 Voxtype"
+                    },
+                    presentation.message
+                ));
+            }
+        }
+    }
     fn create_status_window_with_close_action(&mut self) {
         let application = self
             .application
@@ -512,10 +785,17 @@ impl DesktopShell for GtkDesktopShell {
         stack.add_titled(&statuses, Some("status"), "Status");
         let (mapping_page, mapping_widgets) = self.build_mapping_page();
         stack.add_titled(&mapping_page, Some("button-mapping"), "Button Mapping");
+        let (transcription_page, transcription_widgets) = self.build_transcription_page();
+        stack.add_titled(&transcription_page, Some("transcription"), "语音识别");
         let page_sender = self.event_sender.clone();
         stack.connect_visible_child_name_notify(move |stack| {
             if stack.visible_child_name().as_deref() == Some("button-mapping") {
                 let _ = page_sender.send(DesktopEvent::ButtonMapping(ButtonMappingEvent::Open));
+            }
+            if stack.visible_child_name().as_deref() == Some("transcription") {
+                let _ = page_sender.send(DesktopEvent::TranscriptionSettings(
+                    SettingsRequest::Inspect,
+                ));
             }
         });
         let header_bar = adw::HeaderBar::builder()
@@ -544,6 +824,7 @@ impl DesktopShell for GtkDesktopShell {
         self.status_labels = Some(status_labels);
         self.page_stack = Some(stack);
         self.mapping_widgets = Some(mapping_widgets);
+        self.transcription_widgets = Some(transcription_widgets);
         self.start_tray();
         self.display_status(&DesktopStatus::default());
     }

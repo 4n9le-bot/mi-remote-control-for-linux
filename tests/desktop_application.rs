@@ -15,6 +15,10 @@ use atvv_bridge::{
 struct FakeBridge {
     starts: usize,
     statuses: VecDeque<DesktopStatus>,
+    settings_requests: usize,
+    settings_results:
+        VecDeque<Result<atvv_bridge::transcription_settings::SettingsPresentation, String>>,
+    shutdowns: usize,
 }
 
 impl VoiceBridge for FakeBridge {
@@ -28,6 +32,21 @@ impl VoiceBridge for FakeBridge {
         self.statuses.clear();
         latest
     }
+    fn start_transcription_settings(
+        &mut self,
+        _: atvv_bridge::transcription_settings::SettingsRequest,
+    ) -> Result<(), String> {
+        self.settings_requests += 1;
+        Ok(())
+    }
+    fn take_transcription_settings(
+        &mut self,
+    ) -> Option<Result<atvv_bridge::transcription_settings::SettingsPresentation, String>> {
+        self.settings_results.pop_front()
+    }
+    fn shutdown(&mut self) {
+        self.shutdowns += 1;
+    }
 }
 
 #[derive(Default)]
@@ -40,9 +59,58 @@ struct FakeDesktopShell {
     quits: usize,
     tray_available: bool,
     statuses: Vec<DesktopStatus>,
+    transcription_presentations:
+        Vec<Result<atvv_bridge::transcription_settings::SettingsPresentation, String>>,
+}
+
+#[test]
+fn transcription_settings_report_busy_then_async_errors_without_restarting_voice_bridge() {
+    let bridge = FakeBridge {
+        settings_results: [Err("密钥环锁定，请解锁后重试".into())].into(),
+        ..Default::default()
+    };
+    let mut application = DesktopApplication::new(bridge);
+    let mut shell = FakeDesktopShell::default();
+    application.activate(&mut shell).unwrap();
+    application.transcription_settings_event(
+        atvv_bridge::transcription_settings::SettingsRequest::Inspect,
+        &mut shell,
+    );
+    assert!(shell.transcription_presentations[0].as_ref().unwrap().busy);
+    application.refresh_status(&mut shell);
+    assert!(shell.transcription_presentations[1].is_err());
+    application.activate(&mut shell).unwrap();
+    assert_eq!(application.bridge().starts, 1);
+    assert_eq!(application.bridge().settings_requests, 1);
+    application.quit_requested(&mut shell);
+    assert_eq!(application.bridge().shutdowns, 1);
+    assert_eq!(shell.quits, 1);
+}
+
+#[test]
+fn transcription_failure_displays_the_retained_wav_for_recovery() {
+    let status = DesktopStatus::default().transitioned_by(&OperationalEvent::WavHandoffFailed {
+        at: SystemTime::UNIX_EPOCH,
+        address: "AA:BB:CC:DD:EE:FF".into(),
+        duration: Duration::from_secs(1),
+        audio_bytes: 120,
+        stage: IntegrationStage::Transcription,
+        error: "鉴权失败".into(),
+        retained_wav: Some("/tmp/atvv-bridge/capture-recovery.wav".into()),
+    });
+    let RecentWavHandoff::Failed { error, .. } = status.recent_wav_handoff else {
+        panic!("failure expected")
+    };
+    assert!(error.contains("/tmp/atvv-bridge/capture-recovery.wav"));
 }
 
 impl DesktopShell for FakeDesktopShell {
+    fn render_transcription_settings(
+        &mut self,
+        result: &Result<atvv_bridge::transcription_settings::SettingsPresentation, String>,
+    ) {
+        self.transcription_presentations.push(result.clone());
+    }
     fn create_status_window_with_close_action(&mut self) {
         self.windows_created += 1;
         self.close_action_requested = true;

@@ -27,7 +27,7 @@ use crate::{
 
 static UNIQUE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SystemBoundaries {
     attachment: AttachmentMonitor,
     bluez: Option<zbus::blocking::Connection>,
@@ -37,9 +37,28 @@ pub struct SystemBoundaries {
     signal_handlers_installed: bool,
     status: DesktopStatus,
     status_updates: Option<LatestDesktopStatus>,
+    transcription_settings: Option<crate::transcription_settings::SharedSettings>,
+    online: Option<
+        crate::transcription::OnlineTranscriber<
+            crate::transcription::SystemHttp,
+            crate::transcription_settings::SystemKeyring,
+        >,
+    >,
 }
 
 impl SystemBoundaries {
+    pub fn with_transcription(
+        status_updates: LatestDesktopStatus,
+        settings: crate::transcription_settings::SharedSettings,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            status_updates: Some(status_updates),
+            transcription_settings: Some(settings),
+            shutdown_requested: cancel,
+            ..Self::default()
+        }
+    }
     pub fn with_status_updates(status_updates: LatestDesktopStatus) -> Self {
         Self {
             status_updates: Some(status_updates),
@@ -471,7 +490,36 @@ fn path_property(
 }
 
 impl ProcessExecutor for SystemBoundaries {
+    fn capture_transcription_settings(
+        &mut self,
+        configured: &crate::transcription::TranscriptionSettings,
+    ) -> crate::transcription::TranscriptionSettings {
+        self.transcription_settings
+            .as_ref()
+            .and_then(|settings| settings.read().ok().and_then(|settings| settings.clone()))
+            .unwrap_or_else(|| configured.clone())
+    }
+    fn cancellation_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Relaxed)
+    }
+    fn transcribe_online(
+        &mut self,
+        settings: &crate::transcription::TranscriptionSettings,
+        wav: &[u8],
+    ) -> Result<Option<String>, String> {
+        let online = self.online.get_or_insert_with(|| {
+            crate::transcription::OnlineTranscriber::new(
+                crate::transcription::SystemHttp::new(self.shutdown_requested.clone()),
+                crate::transcription_settings::SystemKeyring::new(self.shutdown_requested.clone()),
+                self.shutdown_requested.clone(),
+            )
+        });
+        online.transcribe(settings, wav)
+    }
     fn execute(&mut self, command: &Command) -> io::Result<CommandOutput> {
+        if self.cancellation_requested() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "操作已取消"));
+        }
         let output = process::Command::new(&command.program)
             .args(&command.args)
             .output()?;

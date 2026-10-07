@@ -249,7 +249,8 @@ impl DesktopStatus {
             StartupError::ReadConfig { .. }
             | StartupError::MissingExplicitConfig(_)
             | StartupError::ParseConfig { .. }
-            | StartupError::InvalidMaxDuration(_) => (
+            | StartupError::InvalidMaxDuration(_)
+            | StartupError::InvalidTranscription => (
                 ActionableFailureKind::Configuration,
                 "Configuration needs attention",
                 "Save a valid replacement configuration to retry.",
@@ -336,12 +337,20 @@ impl DesktopStatus {
                 self.capture = CaptureStatus::Idle;
                 self.wav_handoff = WavHandoffActivity::Active;
             }
-            OperationalEvent::WavHandoffFailed { stage, error, .. } => {
+            OperationalEvent::WavHandoffFailed {
+                stage,
+                error,
+                retained_wav,
+                ..
+            } => {
                 self.capture = CaptureStatus::Idle;
                 self.wav_handoff = WavHandoffActivity::Idle;
                 self.recent_wav_handoff = RecentWavHandoff::Failed {
                     stage: *stage,
-                    error: error.clone(),
+                    error: retained_wav
+                        .as_ref()
+                        .map(|path| format!("{error}\n保留 WAV：{}", path.display()))
+                        .unwrap_or_else(|| error.clone()),
                 };
                 if matches!(
                     stage,
@@ -419,6 +428,18 @@ impl LatestDesktopStatus {
 pub trait VoiceBridge {
     fn start(&mut self) -> io::Result<()>;
     fn take_latest_status(&mut self) -> Option<DesktopStatus>;
+    fn start_transcription_settings(
+        &mut self,
+        _request: crate::transcription_settings::SettingsRequest,
+    ) -> Result<(), String> {
+        Err("语音设置不可用".into())
+    }
+    fn take_transcription_settings(
+        &mut self,
+    ) -> Option<Result<crate::transcription_settings::SettingsPresentation, String>> {
+        None
+    }
+    fn shutdown(&mut self) {}
 }
 
 /// The desktop operations the application needs, independent of GTK widgets.
@@ -432,6 +453,11 @@ pub trait DesktopShell {
     fn quit(&mut self);
     fn render_button_mapping(&mut self, _presentation: &ButtonMappingPresentation) {}
     fn perform_button_mapping_effect(&mut self, _effect: ButtonMappingEffect) {}
+    fn render_transcription_settings(
+        &mut self,
+        _result: &Result<crate::transcription_settings::SettingsPresentation, String>,
+    ) {
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -863,6 +889,7 @@ pub struct DesktopApplication<B, M = crate::button_mapping_backend::ProcessButto
     bridge: B,
     button_mapping: ButtonMappingController<M>,
     started: bool,
+    transcription_settings_busy: bool,
 }
 
 impl<B> DesktopApplication<B, crate::button_mapping_backend::ProcessButtonMappingBackend>
@@ -887,6 +914,7 @@ where
             bridge,
             button_mapping: ButtonMappingController::new(button_mapping_backend),
             started: false,
+            transcription_settings_busy: false,
         }
     }
 
@@ -929,6 +957,34 @@ where
         if let Some(status) = self.bridge.take_latest_status() {
             shell.display_status(&status);
         }
+        if let Some(result) = self.bridge.take_transcription_settings() {
+            self.transcription_settings_busy = false;
+            shell.render_transcription_settings(&result);
+        }
+    }
+
+    pub fn transcription_settings_event(
+        &mut self,
+        request: crate::transcription_settings::SettingsRequest,
+        shell: &mut impl DesktopShell,
+    ) {
+        if self.transcription_settings_busy {
+            return;
+        }
+        match self.bridge.start_transcription_settings(request) {
+            Err(error) => shell.render_transcription_settings(&Err(error)),
+            Ok(()) => {
+                self.transcription_settings_busy = true;
+                shell.render_transcription_settings(&Ok(
+                    crate::transcription_settings::SettingsPresentation {
+                        settings: Default::default(),
+                        configured: false,
+                        busy: true,
+                        message: "正在访问配置与系统密钥环…".into(),
+                    },
+                ));
+            }
+        }
     }
 
     pub fn close_requested(&mut self, shell: &mut impl DesktopShell) {
@@ -955,12 +1011,14 @@ where
                 ButtonMappingState::Applying | ButtonMappingState::Resetting
             )
         {
+            self.bridge.shutdown();
             shell.quit();
             shell.perform_button_mapping_effect(ButtonMappingEffect::Quit);
         }
     }
 
     pub fn quit_requested(&mut self, shell: &mut impl DesktopShell) {
+        self.bridge.shutdown();
         shell.quit();
     }
 }
@@ -969,13 +1027,22 @@ where
 pub struct InProcessVoiceBridge {
     selection: Option<ConfigSelection>,
     latest_status: LatestDesktopStatus,
+    settings_selection: ConfigSelection,
+    shared_settings: crate::transcription_settings::SharedSettings,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    settings_result:
+        Option<mpsc::Receiver<Result<crate::transcription_settings::SettingsPresentation, String>>>,
 }
 
 impl InProcessVoiceBridge {
     pub fn new(selection: ConfigSelection) -> Self {
         Self {
+            settings_selection: selection.clone(),
             selection: Some(selection),
             latest_status: LatestDesktopStatus::default(),
+            shared_settings: Default::default(),
+            cancel: Default::default(),
+            settings_result: None,
         }
     }
 }
@@ -986,10 +1053,12 @@ impl VoiceBridge for InProcessVoiceBridge {
             io::Error::new(io::ErrorKind::AlreadyExists, "ATVV Voice Bridge started")
         })?;
         let latest_status = self.latest_status.clone();
+        let settings = self.shared_settings.clone();
+        let cancel = self.cancel.clone();
         thread::Builder::new()
             .name("atvv-voice-bridge".into())
             .spawn(move || {
-                run_with_config_recovery(selection, latest_status);
+                run_with_config_recovery(selection, latest_status, settings, cancel);
             })?;
         Ok(())
     }
@@ -997,9 +1066,61 @@ impl VoiceBridge for InProcessVoiceBridge {
     fn take_latest_status(&mut self) -> Option<DesktopStatus> {
         self.latest_status.take_latest()
     }
+    fn shutdown(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn start_transcription_settings(
+        &mut self,
+        request: crate::transcription_settings::SettingsRequest,
+    ) -> Result<(), String> {
+        if self.settings_result.is_some() {
+            return Err("语音设置操作正在进行，请稍候".into());
+        }
+        let (sender, receiver) = mpsc::channel();
+        let selection = self.settings_selection.clone();
+        let shared = self.shared_settings.clone();
+        let cancel = self.cancel.clone();
+        thread::Builder::new()
+            .name("transcription-settings".into())
+            .spawn(move || {
+                let mut service = crate::transcription_settings::SettingsService::new(
+                    crate::transcription_settings::SystemKeyring::new(cancel.clone()),
+                    selection,
+                    shared,
+                );
+                let result = service.perform(request);
+                if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = sender.send(result);
+                }
+            })
+            .map_err(|_| "无法启动设置操作")?;
+        self.settings_result = Some(receiver);
+        Ok(())
+    }
+    fn take_transcription_settings(
+        &mut self,
+    ) -> Option<Result<crate::transcription_settings::SettingsPresentation, String>> {
+        match self.settings_result.as_ref()?.try_recv() {
+            Ok(result) => {
+                self.settings_result = None;
+                Some(result)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.settings_result = None;
+                Some(Err("设置操作已停止，请重试".into()))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        }
+    }
 }
 
-fn run_with_config_recovery(selection: ConfigSelection, latest_status: LatestDesktopStatus) {
+fn run_with_config_recovery(
+    selection: ConfigSelection,
+    latest_status: LatestDesktopStatus,
+    settings: crate::transcription_settings::SharedSettings,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     let watcher = match ConfigDirectoryWatcher::new(&selection) {
         Ok(watcher) => watcher,
         Err(error) => {
@@ -1008,7 +1129,11 @@ fn run_with_config_recovery(selection: ConfigSelection, latest_status: LatestDes
         }
     };
     loop {
-        let mut boundaries = SystemBoundaries::with_status_updates(latest_status.clone());
+        let mut boundaries = SystemBoundaries::with_transcription(
+            latest_status.clone(),
+            settings.clone(),
+            cancel.clone(),
+        );
         match Application::start(selection.clone(), &mut boundaries) {
             Ok(application) => {
                 let _ = application.run();

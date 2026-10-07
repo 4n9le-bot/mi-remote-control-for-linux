@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod button_mapping;
@@ -14,6 +14,8 @@ pub mod desktop;
 pub mod helper_protocol;
 pub mod hwdb_mapping;
 pub mod system;
+pub mod transcription;
+pub mod transcription_settings;
 
 pub use desktop::{
     ActionableFailure, ActionableFailureKind, AtvvProfileReadiness, BatteryStatus,
@@ -506,6 +508,22 @@ pub struct CommandOutput {
 
 pub trait ProcessExecutor {
     fn execute(&mut self, command: &Command) -> io::Result<CommandOutput>;
+    fn capture_transcription_settings(
+        &mut self,
+        configured: &transcription::TranscriptionSettings,
+    ) -> transcription::TranscriptionSettings {
+        configured.clone()
+    }
+    fn transcribe_online(
+        &mut self,
+        _settings: &transcription::TranscriptionSettings,
+        _wav: &[u8],
+    ) -> Result<Option<String>, String> {
+        Err("在线识别不可用".into())
+    }
+    fn cancellation_requested(&self) -> bool {
+        false
+    }
 }
 
 pub trait Storage {
@@ -696,11 +714,12 @@ fn absolute_nonempty_path(value: Option<&OsStr>) -> Option<PathBuf> {
     (!path.as_os_str().is_empty() && path.is_absolute()).then_some(path)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Config {
     pub max_duration_secs: u64,
     pub wav_dir: PathBuf,
     pub keep_wav: bool,
+    pub transcription: transcription::TranscriptionSettings,
 }
 
 impl Default for Config {
@@ -709,6 +728,7 @@ impl Default for Config {
             max_duration_secs: DEFAULT_MAX_DURATION_SECS,
             wav_dir: DEFAULT_WAV_DIR.into(),
             keep_wav: false,
+            transcription: Default::default(),
         }
     }
 }
@@ -719,6 +739,7 @@ struct ConfigFile {
     max_duration_secs: Option<u64>,
     wav_dir: Option<PathBuf>,
     keep_wav: Option<bool>,
+    transcription: Option<transcription::TranscriptionSettings>,
 }
 
 #[derive(Debug, Error)]
@@ -739,6 +760,8 @@ pub enum StartupError {
     },
     #[error("max_duration_secs must be between 1 and {MAX_DURATION_SECS} seconds, got {0}")]
     InvalidMaxDuration(u64),
+    #[error("语音识别配置无效，请检查模型、资源 ID 和区域")]
+    InvalidTranscription,
     #[error("WAV directory {path} is unusable: {source}")]
     PrepareWavDir {
         path: PathBuf,
@@ -846,6 +869,7 @@ struct Capture {
     samples: Vec<i16>,
     audio_bytes: usize,
     started_at: SystemTime,
+    transcription: transcription::TranscriptionSettings,
 }
 
 struct HandoffMetadata {
@@ -981,6 +1005,9 @@ where
                                 samples: Vec::new(),
                                 audio_bytes: 0,
                                 started_at: notification.received_at,
+                                transcription: self
+                                    .boundaries
+                                    .capture_transcription_settings(&self.config.transcription),
                             });
                             self.boundaries
                                 .emit(OperationalEvent::CaptureStarted { at, stream_id });
@@ -1088,6 +1115,7 @@ where
             &metadata,
             completed.profile.sample_rate_hz(),
             &completed.samples,
+            &completed.transcription,
         );
         self.boundaries.emit(OperationalEvent::CaptureCompleted {
             at,
@@ -1101,6 +1129,7 @@ where
         metadata: &HandoffMetadata,
         sample_rate_hz: u32,
         samples: &[i16],
+        settings: &transcription::TranscriptionSettings,
     ) {
         let wav = pcm16_wav(sample_rate_hz, samples);
         let path = match self
@@ -1118,48 +1147,72 @@ where
                 return;
             }
         };
-        let transcription = Command {
-            program: "voxtype".into(),
-            args: vec!["transcribe".into(), path.display().to_string()],
-        };
-        let output = match self.boundaries.execute(&transcription) {
-            Ok(output) => output,
-            Err(error) => {
+        let transcript = if settings.provider != transcription::Provider::Voxtype {
+            match self.boundaries.transcribe_online(settings, &wav) {
+                Ok(text) => text,
+                Err(error) => {
+                    self.emit_handoff_failure(
+                        metadata,
+                        IntegrationStage::Transcription,
+                        error,
+                        Some(path),
+                    );
+                    return;
+                }
+            }
+        } else {
+            let transcription = Command {
+                program: "voxtype".into(),
+                args: vec!["transcribe".into(), path.display().to_string()],
+            };
+            let output = match self.boundaries.execute(&transcription) {
+                Ok(output) => output,
+                Err(error) => {
+                    self.emit_handoff_failure(
+                        metadata,
+                        IntegrationStage::Transcription,
+                        format!("could not run voxtype: {error}"),
+                        Some(path),
+                    );
+                    return;
+                }
+            };
+            if output.status != 0 {
                 self.emit_handoff_failure(
                     metadata,
                     IntegrationStage::Transcription,
-                    format!("could not run voxtype: {error}"),
+                    format!("voxtype exited with status {}", output.status),
                     Some(path),
                 );
                 return;
             }
+            let stdout = match String::from_utf8(output.stdout) {
+                Ok(stdout) => stdout,
+                Err(_) => {
+                    self.emit_handoff_failure(
+                        metadata,
+                        IntegrationStage::Transcription,
+                        "voxtype produced non-UTF-8 output".into(),
+                        Some(path),
+                    );
+                    return;
+                }
+            };
+            voxtype_transcript(&stdout).map(str::to_owned)
         };
-        if output.status != 0 {
+        if self.boundaries.cancellation_requested() {
             self.emit_handoff_failure(
                 metadata,
                 IntegrationStage::Transcription,
-                format!("voxtype exited with status {}", output.status),
+                "识别已取消，WAV 已保留".into(),
                 Some(path),
             );
             return;
         }
-        let stdout = match String::from_utf8(output.stdout) {
-            Ok(stdout) => stdout,
-            Err(_) => {
-                self.emit_handoff_failure(
-                    metadata,
-                    IntegrationStage::Transcription,
-                    "voxtype produced non-UTF-8 output".into(),
-                    Some(path),
-                );
-                return;
-            }
-        };
-        let transcript = voxtype_transcript(&stdout);
         let outcome = if let Some(transcript) = transcript {
             let commit = Command {
                 program: "fcitx5-commit".into(),
-                args: vec!["--text".into(), transcript.into()],
+                args: vec!["--text".into(), transcript],
             };
             let output = match self.boundaries.execute(&commit) {
                 Ok(output) => output,
@@ -1284,7 +1337,10 @@ fn pcm16_wav(sample_rate_hz: u32, samples: &[i16]) -> Vec<u8> {
     wav
 }
 
-fn load_config<B>(selection: ConfigSelection, storage: &mut B) -> Result<Config, StartupError>
+pub(crate) fn load_config<B>(
+    selection: ConfigSelection,
+    storage: &mut B,
+) -> Result<Config, StartupError>
 where
     B: Storage,
 {
@@ -1307,19 +1363,26 @@ where
             Ok(Config::default())
         };
     };
-    let file =
-        toml::from_str::<ConfigFile>(&contents).map_err(|source| StartupError::ParseConfig {
+    let file = toml::from_str::<ConfigFile>(&contents).map_err(|mut source| {
+        source.set_input(None);
+        StartupError::ParseConfig {
             path: path.clone(),
             source,
-        })?;
+        }
+    })?;
     let defaults = Config::default();
     let config = Config {
         max_duration_secs: file.max_duration_secs.unwrap_or(defaults.max_duration_secs),
         wav_dir: file.wav_dir.unwrap_or(defaults.wav_dir),
         keep_wav: file.keep_wav.unwrap_or(defaults.keep_wav),
+        transcription: file.transcription.unwrap_or_default(),
     };
     if !(1..=MAX_DURATION_SECS).contains(&config.max_duration_secs) {
         return Err(StartupError::InvalidMaxDuration(config.max_duration_secs));
     }
+    config
+        .transcription
+        .validate()
+        .map_err(|_| StartupError::InvalidTranscription)?;
     Ok(config)
 }
